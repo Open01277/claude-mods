@@ -22,13 +22,6 @@ claude plugin install quota-pets@claude-mods
 claude plugin marketplace update claude-mods
 ```
 
-以前裝過 `quota-cat` 的電腦，它已經改名成 `quota-pets`，舊的要先移除：
-
-```bash
-claude plugin uninstall quota-cat@claude-mods
-claude plugin install quota-pets@claude-mods
-```
-
 ## 新增一個 mod
 
 1. 把 mod 資料夾放到 `plugins/<mod-name>/`
