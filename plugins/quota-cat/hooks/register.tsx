@@ -422,7 +422,7 @@ async function ingest($: EngineInterface, rateLimits: readonly SessionRateLimit[
   }
 
   const cat = catById(save.cat.id)
-  const pct = Math.floor(five.pct)
+  const pct = Math.round(five.pct)
   const countdown = five.resetsAt === null ? '幾小時' : dur(five.resetsAt - now)
   if (five.pct >= 100 && !save.cat.isDead) {
     const entry = save.dex[cat.id] ?? { count: 1, deaths: 0 }
@@ -641,7 +641,7 @@ export const register: Register = on => {
               <Box flexDirection="row" columnGap={1}>
                 <Text dimColor>5h</Text>
                 <Text color={barColor(five.pct)}>{bar(five.pct)}</Text>
-                <Text>{`${Math.floor(five.pct)}%`}</Text>
+                <Text>{`${Math.round(five.pct)}%`}</Text>
                 <Text dimColor>{`· ${countdown} 後重置`}</Text>
               </Box>
             )}
@@ -649,7 +649,7 @@ export const register: Register = on => {
             {week !== null && food !== null && (
               <Box flexDirection="row" columnGap={1}>
                 <Text dimColor>貓糧(週)</Text>
-                <Text color={food.color}>{`${Math.floor(week.pct)}%`}</Text>
+                <Text color={food.color}>{`${Math.round(week.pct)}%`}</Text>
                 <Text dimColor wrap="truncate-end">
                   {`· ${food.text}`}
                 </Text>
