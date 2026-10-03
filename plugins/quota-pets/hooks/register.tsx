@@ -554,9 +554,13 @@ function collect(save: Save, pet: Pet): string {
   return `重複！自動分解成${treat} ×1，${treat}沒有任何用途`
 }
 
+function remember(save: Save, pet: Pet, title: string): void {
+  save.history = [`[${pet.rarity}] ${title}`, ...save.history].slice(0, 8)
+}
+
 function announce($: EngineInterface, save: Save, pet: Pet, title: string, extra: string): void {
   const luck = chance(LUCK[pet.rarity])
-  save.history = [`[${pet.rarity}] ${title}`, ...save.history].slice(0, 8)
+  remember(save, pet, title)
   $.ui.toast(`${portrait(pet)} [${pet.rarity}] ${title} ── ${luck}`, { timeoutMs: 12_000 })
   $.ui.log(`扭蛋 [${pet.rarity}] ${title} ── ${luck}｜${extra}`)
 }
@@ -582,7 +586,6 @@ async function load($: EngineInterface): Promise<Save> {
     history: ['扭蛋機到貨：貓狗混池，每個對話抽一隻'],
   }
   await $.store.set('save', save)
-  $.ui.toast('扭蛋機到貨！貓狗混池開張，每個對話抽一隻 (=^･ω･^=)ﾉ U・ᴥ・U', { timeoutMs: 10_000 })
   return save
 }
 
@@ -598,6 +601,7 @@ function warnedAt(pet: Pet, pct: number | null): number {
 }
 
 // A new conversation pulls its own pet; one pulled after the quota ran out is dead on arrival.
+// An ordinary pull is quiet (the band shows the pet, /petdex keeps it); dead on arrival is announced.
 function hatch($: EngineInterface, save: Save, conv: number, five: QuotaPetsLimit | null, now: number): QuotaPetsLife {
   const pet = pull(save)
   const extra = collect(save, pet)
@@ -609,7 +613,8 @@ function hatch($: EngineInterface, save: Save, conv: number, five: QuotaPetsLimi
   const title = isDead
     ? `新對話抽到${pet.name}…但額度已經用完，牠一出蛋就陣亡了（${countdownOf(five, now)} 後轉生）`
     : `新對話，新扭蛋：${pet.name}`
-  announce($, save, pet, title, extra)
+  if (isDead) announce($, save, pet, title, extra)
+  else remember(save, pet, title)
 
   return {
     conv,

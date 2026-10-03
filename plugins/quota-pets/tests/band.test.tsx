@@ -69,8 +69,8 @@ test('a conversation pulls a pet that follows the quota to its death and is rebo
   const w = world(on, limits(12.3, 20.2))
 
   await $.session.start(START)
-  expect(w.shown.some(text => text.includes('扭蛋機到貨'))).toBe(true)
-  expect(w.shown.some(text => text.includes('新對話，新扭蛋'))).toBe(true)
+  // Opening a conversation is quiet: no toast, no transcript line.
+  expect(w.shown).toEqual([])
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const drawn = await band($, surface)
@@ -88,7 +88,9 @@ test('a conversation pulls a pet that follows the quota to its death and is rebo
     expect(drawn).toContain(`${Math.ceil(pct)}%`)
     console.log(`${pct}% → ${drawn}`)
   }
+  // The fun ones still pop: two ghost-story warnings, then the death.
   expect(w.shown.some(text => text.includes('(✖╭╮✖)'))).toBe(true)
+  expect(w.shown.filter(text => text.includes('額度')).length).toBe(2)
 
   await clock.advance(3 * HOUR)
   w.rateLimits = limits(3, 41, NOW + 8 * HOUR)
@@ -108,25 +110,28 @@ test('every conversation pulls its own pet, and going back to one brings its pet
   mock.clock(on, { now: NOW })
   mock.store(on)
   const w = world(on, limits(30, 20))
-  const pulls = () => w.shown.filter(text => text.startsWith('log: 扭蛋')).length
+  const pulls = async () => {
+    const dex = await $.command.run({ command: 'petdex', args: '' } as never)
+    return Number(/總抽數 (\d+)/.exec(dex.text)?.[1])
+  }
 
   await $.session.start(START)
   const first = await band($)
-  expect(pulls()).toBe(1)
+  expect(await pulls()).toBe(1)
 
   // A hot reload runs session.start again in the same conversation.
   await $.session.start(START)
-  expect(pulls()).toBe(1)
+  expect(await pulls()).toBe(1)
 
   // /clear: a new conversation in the same session.
   w.startedAt = NOW + 60_000
   await $.turn.start({ text: 'hi', turnId: 't1' } as never)
-  expect(pulls()).toBe(2)
+  expect(await pulls()).toBe(2)
 
   // Resuming the first conversation.
   w.startedAt = NOW
   await $.turn.start({ text: 'hi again', turnId: 't2' } as never)
-  expect(pulls()).toBe(2)
+  expect(await pulls()).toBe(2)
   expect(await band($)).toBe(first)
 
   const dex = await $.command.run({ command: 'petdex', args: '' } as never)
@@ -139,6 +144,7 @@ test('a conversation started after the quota ran out pulls a pet that is dead on
   const w = world(on, limits(100, 60))
 
   await $.session.start(START)
+  // Dead on arrival is funny enough to announce, even at the start.
   expect(w.shown.some(text => text.includes('一出蛋就陣亡'))).toBe(true)
   expect(w.shown.some(text => text.includes('(✖╭╮✖)'))).toBe(false)
   const drawn = await band($)
