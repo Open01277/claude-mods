@@ -5,14 +5,14 @@
 ## 安裝
 
 ```bash
-claude plugin marketplace add Open01277/claude-mods
+claude plugin marketplace add https://github.com/Open01277/claude-mods.git
 claude plugin install quota-cat@claude-mods
 ```
 
 也可以在 Claude Code 裡面輸入：
 
 ```
-/plugin marketplace add Open01277/claude-mods
+/plugin marketplace add https://github.com/Open01277/claude-mods.git
 /plugin install quota-cat@claude-mods
 ```
 
