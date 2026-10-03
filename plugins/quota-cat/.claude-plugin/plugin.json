@@ -1,0 +1,6 @@
+{
+  "name": "quota-cat",
+  "version": "0.1.0",
+  "description": "額度貓咪扭蛋：5 小時與週額度變成一隻會講鬼故事、會陣亡、會轉生的顏文字貓",
+  "types": "./types/index.d.ts"
+}
