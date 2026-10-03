@@ -6,20 +6,27 @@
 
 ```bash
 claude plugin marketplace add https://github.com/Open01277/claude-mods.git
-claude plugin install quota-cat@claude-mods
+claude plugin install quota-pets@claude-mods
 ```
 
 也可以在 Claude Code 裡面輸入：
 
 ```
 /plugin marketplace add https://github.com/Open01277/claude-mods.git
-/plugin install quota-cat@claude-mods
+/plugin install quota-pets@claude-mods
 ```
 
 ## 更新
 
 ```bash
 claude plugin marketplace update claude-mods
+```
+
+以前裝過 `quota-cat` 的電腦，它已經改名成 `quota-pets`，舊的要先移除：
+
+```bash
+claude plugin uninstall quota-cat@claude-mods
+claude plugin install quota-pets@claude-mods
 ```
 
 ## 新增一個 mod
