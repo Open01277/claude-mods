@@ -22,12 +22,14 @@ function spelled(path: string): string {
   return path.replace(/\\/g, '/').toLowerCase()
 }
 
-// Every string a drawing shows: text children, Button labels and Code sources.
+// Every string a drawing shows: text children, Button labels, Code sources and Markdown text.
 function textOf(node: unknown): string {
   if (typeof node === 'string') return node
   if (node === null || typeof node !== 'object') return ''
   const element = node as RenderElement & { children?: unknown[]; props?: Record<string, unknown> }
-  const own = [element.props?.label, element.props?.source].filter((value): value is string => typeof value === 'string')
+  const own = [element.props?.label, element.props?.source, element.props?.text].filter(
+    (value): value is string => typeof value === 'string',
+  )
   return [...own, ...(element.children ?? []).map(textOf)].join(' ')
 }
 
@@ -38,7 +40,11 @@ type World = {
   bash: unknown
   status: string | undefined
   opened: string[]
+  toasts: string[]
+  logs: string[]
 }
+
+const RAN = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 
 // The engine beneath the plugin: files in memory, and the file tools acting on them.
 function world(on: On, files: Readonly<Record<string, string>>, root = ROOT): World {
@@ -49,6 +55,8 @@ function world(on: On, files: Readonly<Record<string, string>>, root = ROOT): Wo
     bash: undefined,
     status: undefined,
     opened: [],
+    toasts: [],
+    logs: [],
   }
   const get = (path: string) => w.files.get(spelled(path))
   on('session.start', ($, e) => ({ cwd: (e as { cwd: string }).cwd }) as never)
@@ -64,13 +72,25 @@ function world(on: On, files: Readonly<Record<string, string>>, root = ROOT): Wo
     return { value: text } as never
   })
   on('fs.exists', ($, e) => ({ value: get((e as { path: string }).path) !== undefined }) as never)
+  on('fs.write', ($, e) => {
+    const { path, text } = e as { path: string; text: string }
+    w.files.set(spelled(path), text)
+    return { value: undefined } as never
+  })
+  on('ui.toast', ($, e) => {
+    w.toasts.push((e as { text: string }).text)
+    return { value: undefined } as never
+  })
   on('command.register', ($, e) => ({ value: { command: (e as { name: string }).name } }) as never)
   on('tool.register', ($, e) => ({ value: { tool: `mcp__convo-diff__${(e as { name: string }).name}` } }) as never)
   on('ui.status', ($, e) => {
     w.status = (e as { text: string | undefined }).text
     return { value: undefined } as never
   })
-  on('ui.log', () => ({ value: undefined }) as never)
+  on('ui.log', ($, e) => {
+    w.logs.push((e as { text: string }).text)
+    return { value: undefined } as never
+  })
   on('ui.open', ($, e) => {
     w.opened.push((e as { id: string }).id)
     return { value: { isPlaced: true } } as never
@@ -377,4 +397,135 @@ test('the command opens the pane and the model can read the same diff', async ($
   expect(only).toContain('+bee')
   expect(only).not.toContain('a.txt')
   console.log(patch)
+})
+
+async function mountPane($: Engine, surface: (typeof SURFACES)[number] = 'terminal') {
+  return $.ui.mount({ plugin: 'convo-diff', surface, component: 'Pane', props: PANE_PROPS as never, requestId: 'convo-diff' })
+}
+
+test('Explain asks Claude in the conversation, as the person, about that one file', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const OLD = 'D:\\proj\\old.txt'
+  const w = world(on, { [A]: 'one\ntwo\n', [OLD]: 'bye\n' })
+  const sent: { text: string; origin: unknown }[] = []
+  on('prompt.submit', ($, e) => {
+    const { text, origin } = e as { text: string; origin: unknown }
+    sent.push({ text, origin })
+    return { text } as never
+  })
+  await $.session.start(START)
+  await clock.advance(1000)
+  await edit($, A, 'two', 'TWO')
+  await $.tool.call({ tool: 'Write', file_path: 'D:\\proj\\new.md', content: '# new\n' } as never)
+  w.bash = {
+    files: [{ filePath: OLD, deleted: true, hunks: [{ oldStart: 1, oldLines: 1, newStart: 0, newLines: 0, lines: ['-bye'] }] }],
+    moreFiles: 0,
+  }
+  w.files.delete(spelled(OLD))
+  await $.tool.call({ tool: 'Bash', command: 'rm old.txt' } as never)
+  await clock.advance(1000)
+
+  for (const surface of SURFACES) {
+    const ui = await mountPane($, surface)
+    expect(await ui.find({ key: 'x0', type: 'Button' })).toBeDefined()
+    await ui.unmount()
+  }
+
+  const ui = await mountPane($)
+  await ui.press({ key: 'x0' })
+  await clock.advance(10)
+  expect(sent).toHaveLength(1)
+  expect(sent[0]?.text).toContain('請解釋這個對話對 `a.txt` 做的改動')
+  expect(sent[0]?.text).toContain('mcp__convo-diff__diff')
+  expect(sent[0]?.text).toContain('不要修改任何檔案')
+  // The person pressed for it: it reads as their own question.
+  expect(sent[0]?.origin).toMatchObject({ kind: 'plugin', asUser: true })
+  expect(w.toasts).toContain('已請 Claude 解釋 a.txt')
+  // The answer is the conversation's: the pane draws none.
+  expect(await ui.findAll({ type: 'Markdown' })).toHaveLength(0)
+
+  // A file the conversation created, or removed, is asked about as one.
+  await ui.press({ key: 'x1' })
+  await ui.press({ key: 'x2' })
+  await clock.advance(10)
+  expect(sent[1]?.text).toContain('新增的 `new.md`')
+  expect(sent[2]?.text).toContain('為什麼刪除 `old.txt`')
+
+  // While Claude works, the question waits for the turn to end, and says so.
+  await $.turn.start({ text: 'keep going', turnId: 't1' } as never)
+  await ui.press({ key: 'x0' })
+  await clock.advance(10)
+  expect(w.toasts.at(-1)).toBe('Claude 這回合結束後會解釋 a.txt')
+  await ui.unmount()
+  console.log(sent.map(one => one.text).join('\n'))
+})
+
+test('Revert puts a file back after a yes, tells the model, and can be undone unless the file changed since', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, { [A]: 'one\ntwo\n' })
+  const N = 'D:\\proj\\made by claude.txt'
+  const commands: string[][] = []
+  on('process.run', ($, e) => {
+    const argv = (e as { argv: string[] }).argv
+    commands.push([...argv])
+    const removed = /-LiteralPath '((?:[^']|'')*)' -Force/.exec(argv[4] ?? '')
+    if (argv[0] === 'powershell' && removed !== null) w.files.delete(spelled((removed[1] ?? '').replace(/''/g, "'")))
+    return { value: argv[0] === 'git' ? { ...RAN, exitCode: 128 } : RAN } as never
+  })
+  await $.session.start(START)
+  await clock.advance(1000)
+  await edit($, A, 'two', 'TWO')
+  await $.tool.call({ tool: 'Write', file_path: N, content: 'new file\n' } as never)
+  await clock.advance(1000)
+
+  const ui = await mountPane($)
+  // Asked first; a no leaves the file alone.
+  await ui.press({ key: 'r0' })
+  expect(textOf(await ui.drawn())).toContain('把 a.txt 還原成這個對話改之前的內容？')
+  await ui.press({ key: 'rn0' })
+  expect(textOf(await ui.drawn())).not.toContain('還原成這個對話改之前的內容？')
+  expect(w.files.get(spelled(A))).toBe('one\nTWO\n')
+
+  await ui.press({ key: 'r0' })
+  await ui.press({ key: 'rc0' })
+  expect(w.files.get(spelled(A))).toBe('one\ntwo\n')
+  expect(w.toasts.some(text => text.includes('已把 a.txt 還原'))).toBe(true)
+  // The plugin tells the model through $.session.append, which the test kit has no conversation for:
+  // the attempt is what shows here, and its failure costs the revert nothing.
+  expect(w.logs.some(text => text.startsWith('could not tell the model'))).toBe(true)
+  await clock.advance(1000)
+  const reverted = textOf(await ui.drawn())
+  expect(reverted).toContain('無差異')
+  expect(reverted).toContain('復原')
+
+  // Undo: the file is as the conversation left it.
+  await ui.press({ key: 'u0' })
+  expect(w.files.get(spelled(A))).toBe('one\nTWO\n')
+  await clock.advance(1000)
+  expect(textOf(await ui.drawn())).toContain('+TWO')
+
+  // A file this conversation created is removed, and comes back on undo.
+  await ui.press({ key: 'r1' })
+  expect(textOf(await ui.drawn())).toContain('刪除 made by claude.txt？')
+  await ui.press({ key: 'rc1' })
+  expect(w.files.has(spelled(N))).toBe(false)
+  expect(commands.some(argv => argv[0] === 'powershell' && (argv[4] ?? '').includes("'D:\\proj\\made by claude.txt'"))).toBe(true)
+  await clock.advance(1000)
+  expect(textOf(await ui.drawn())).toContain('建立之後又刪掉了')
+  await ui.press({ key: 'u1' })
+  expect(w.files.get(spelled(N))).toBe('new file\n')
+
+  // Reverted, then changed again: an undo would lose that change, so it is refused.
+  await ui.press({ key: 'r0' })
+  await ui.press({ key: 'rc0' })
+  await edit($, A, 'one', 'ONE')
+  await ui.press({ key: 'u0' })
+  expect(w.files.get(spelled(A))).toBe('ONE\ntwo\n')
+  expect(w.toasts.some(text => text.includes('又被改過了'))).toBe(true)
+  await clock.advance(1000)
+  expect(await ui.find({ key: 'u0' })).toBeUndefined()
+  await ui.unmount()
+  console.log(w.toasts.join('\n'))
 })

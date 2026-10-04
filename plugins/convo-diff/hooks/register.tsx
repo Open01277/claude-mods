@@ -1,7 +1,14 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { ConvoDiffBase, ConvoDiffFile, ConvoDiffStatus, ConvoDiffTrack, ConvoDiffView } from '../types'
+import type {
+  ConvoDiffBase,
+  ConvoDiffFile,
+  ConvoDiffStatus,
+  ConvoDiffTrack,
+  ConvoDiffUndo,
+  ConvoDiffView,
+} from '../types'
 import { diffText, isBinary, unapply } from './diff'
 import type { Hunk } from './diff'
 
@@ -13,6 +20,7 @@ const TOOL = 'mcp__convo-diff__diff'
 const trackAtom = atom({ plugin: 'convo-diff', key: 'track' } as const, null)
 const viewAtom = atom({ plugin: 'convo-diff', key: 'view' } as const, null)
 const openAtom = atom({ plugin: 'convo-diff', key: 'open' } as const, null)
+const revertAtom = atom({ plugin: 'convo-diff', key: 'revert' } as const, null)
 
 const DEBOUNCE_MS = 150
 // A drawn tree is refused past 100,000 characters serialized: the diffs get most of it.
@@ -23,6 +31,8 @@ const TOOL_BUDGET = 40_000
 const STORE_BUDGET = 3 * 1024 * 1024
 const STORE_ONE = 1536 * 1024
 const KEEP_CONVS = 20
+// A revert keeps the text it replaced, for an undo, up to this size.
+const UNDO_MAX = 1024 * 1024
 
 const STATUS_LABEL: Record<ConvoDiffStatus, string> = {
   added: '新增',
@@ -339,6 +349,7 @@ async function ensure($: EngineInterface): Promise<ConvoDiffTrack> {
   await update($, trackAtom, () => track)
   await update($, viewAtom, () => null)
   await update($, openAtom, () => ({ conv, keys: {} }))
+  await update($, revertAtom, () => ({ conv, confirm: null, undo: {} }))
   if (track.files.length > start.files.length) await persist($, track)
 
   return track
@@ -479,7 +490,149 @@ function patchText(files: readonly ConvoDiffFile[], filter: string): string {
   return out.join('\n')
 }
 
+function canExplain(file: ConvoDiffFile): boolean {
+  return file.chunks.length > 0 && !file.isBinary
+}
+
+// A binary file's base went through text and may not survive the trip back.
+function canRevert(file: ConvoDiffFile): boolean {
+  return (file.status === 'modified' || file.status === 'added' || file.status === 'deleted') && !file.isBinary
+}
+
+// The question the Explain button sends: answered in the conversation, where it can be followed up, by the
+// session's own model, which reads the net change through this plugin's tool rather than a pasted copy.
+function explainPrompt(file: ConvoDiffFile): string {
+  const path = `\`${file.rel}\``
+  const ask =
+    file.status === 'added'
+      ? `請解釋這個對話新增的 ${path}：它是做什麼的、為什麼需要它、有什麼要注意的。`
+      : file.status === 'deleted'
+        ? `請解釋這個對話為什麼刪除 ${path}，刪掉之後有什麼要注意的。`
+        : `請解釋這個對話對 ${path} 做的改動：改了什麼、為什麼這樣改、有什麼要注意的。`
+  return `${ask}要看它在這個對話裡的淨改動，可以用 ${TOOL} 工具（path 填 ${file.rel}）。只要解釋，不要修改任何檔案。`
+}
+
+// Sent as the person's own question, since they pressed for it. It starts a turn of its own once the session is
+// idle, and the call resolves only then: the toast comes first.
+async function askInChat($: EngineInterface, file: ConvoDiffFile, isBusy: boolean): Promise<void> {
+  $.ui.toast(isBusy ? `Claude 這回合結束後會解釋 ${file.rel}` : `已請 Claude 解釋 ${file.rel}`)
+  try {
+    await $.prompt.submit({ text: explainPrompt(file), asUser: true })
+  } catch (error) {
+    $.ui.toast(`沒辦法送出解釋的問題：${reasonOf(error)}`)
+  }
+}
+
+// $.fs writes but never removes: the platform's own command does.
+async function removeFile($: EngineInterface, path: string): Promise<void> {
+  const argv = isWindowsPath(path)
+    ? [
+        'powershell',
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `Remove-Item -LiteralPath '${path.replace(/\//g, '\\').replace(/'/g, "''")}' -Force`,
+      ]
+    : ['rm', '-f', '--', path]
+  const ran = await $.process.run(argv, { timeoutMs: 20_000 })
+  if (await $.fs.exists(path)) throw new Error(ran.stderr.trim().split('\n')[0] || `exit ${ran.exitCode}`)
+}
+
+// The model keeps its own picture of the files: a note in the conversation tells it what changed beneath it.
+async function tellModel($: EngineInterface, text: string): Promise<void> {
+  try {
+    await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
+  } catch (error) {
+    $.ui.log(`could not tell the model: ${reasonOf(error)}`, { to: 'debug' })
+  }
+}
+
+async function setRevert($: EngineInterface, conv: number, confirm: string | null, undo?: (held: Record<string, ConvoDiffUndo>) => Record<string, ConvoDiffUndo>): Promise<void> {
+  await update($, revertAtom, held => {
+    const kept = held !== null && held.conv === conv ? held.undo : {}
+    return { conv, confirm, undo: undo === undefined ? kept : undo({ ...kept }) }
+  })
+}
+
+async function fileOf($: EngineInterface, key: string, conv: number): Promise<{ base: ConvoDiffBase; rel: string } | null> {
+  const track = await read($, trackAtom)
+  const base = track !== null && track.conv === conv ? track.files.find(file => file.key === key) : undefined
+  if (base === undefined) return null
+  return { base, rel: relOf(base.path, await topOf($)) ?? normalize(base.path) }
+}
+
+// Puts a file back as it was before this conversation first changed it, keeping what it replaced for an undo.
+async function revertFile($: EngineInterface, key: string, conv: number): Promise<void> {
+  await setRevert($, conv, null)
+  const found = await fileOf($, key, conv)
+  if (found === null || found.base.isLost) return
+  const { base, rel } = found
+  const seen = await look($, base.path)
+  if (seen.kind === 'error') {
+    $.ui.toast(`沒辦法還原 ${rel}：${seen.reason}`)
+    return
+  }
+  const before = seen.kind === 'text' ? seen.text : null
+  try {
+    if (base.base !== null) await $.fs.write(base.path, base.base)
+    else if (before !== null) await removeFile($, base.path)
+  } catch (error) {
+    $.ui.toast(`沒辦法還原 ${rel}：${reasonOf(error)}`)
+    return
+  }
+  const canUndo = (before?.length ?? 0) <= UNDO_MAX
+  await setRevert($, conv, null, undo => {
+    if (canUndo) undo[key] = { before, after: base.base }
+    else delete undo[key]
+    return undo
+  })
+  const done = base.base === null ? `已刪除 ${rel}（這個對話新增的檔案）` : `已把 ${rel} 還原成這個對話改之前的樣子`
+  $.ui.toast(canUndo ? done : `${done}；檔案太大，沒辦法復原`)
+  await tellModel(
+    $,
+    base.base === null
+      ? `[convo-diff] 我在 diff 面板把 ${rel} 還原了：它是這個對話新增的檔案，現在已經刪除。`
+      : `[convo-diff] 我在 diff 面板把 ${rel} 還原成這個對話第一次修改它之前的內容，這個對話對它的修改都不在了。之後要改它請先重新讀取。`,
+  )
+  schedule($, [key])
+}
+
+// Undoes a revert, unless the file changed again since: that change would be lost.
+async function undoRevert($: EngineInterface, key: string, conv: number): Promise<void> {
+  const held = await read($, revertAtom)
+  const undo = held !== null && held.conv === conv ? held.undo[key] : undefined
+  const found = await fileOf($, key, conv)
+  if (undo === undefined || found === null) return
+  const { base, rel } = found
+  const drop = () =>
+    setRevert($, conv, held?.confirm ?? null, all => {
+      delete all[key]
+      return all
+    })
+  const seen = await look($, base.path)
+  const current = seen.kind === 'text' ? seen.text : seen.kind === 'missing' ? null : undefined
+  if (current !== undo.after) {
+    $.ui.toast(`${rel} 在還原之後又被改過了，沒辦法復原`)
+    await drop()
+    return
+  }
+  try {
+    if (undo.before !== null) await $.fs.write(base.path, undo.before)
+    else if (current !== null) await removeFile($, base.path)
+  } catch (error) {
+    $.ui.toast(`沒辦法復原 ${rel}：${reasonOf(error)}`)
+    return
+  }
+  await drop()
+  $.ui.toast(`已復原 ${rel}`)
+  await tellModel($, `[convo-diff] 我復原了剛才對 ${rel} 的還原，檔案回到還原之前的內容${undo.before === null ? '（也就是不存在）' : ''}。之後要改它請先重新讀取。`)
+  schedule($, [key])
+}
+
 export const register: Register = on => {
+  // The turns running now: a question asked meanwhile waits for them.
+  const running = new Set<string>()
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: COMMAND,
@@ -511,6 +664,7 @@ export const register: Register = on => {
         cache.clear()
         await update($, trackAtom, () => null)
         await update($, viewAtom, () => null)
+        await update($, revertAtom, () => null)
         $.ui.status(undefined)
       })
     }
@@ -519,6 +673,7 @@ export const register: Register = on => {
   })
 
   on('turn.start', async ($, e, next) => {
+    running.add(e.turnId)
     await serial(() => ensure($)).catch(() => undefined)
 
     return next(e)
@@ -526,6 +681,7 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
+    running.delete(e.turnId)
     if (e.agentId === undefined) schedule($, 'all')
 
     return result
@@ -627,6 +783,7 @@ export const register: Register = on => {
     const { Box, Button, Code, Text } = $.ui.resolve(e)
     const view = await read($, viewAtom)
     const open = await read($, openAtom)
+    const reverts = await read($, revertAtom)
     const files = view?.files ?? []
 
     if (view === null || files.length === 0) {
@@ -653,6 +810,8 @@ export const register: Register = on => {
     const setAll = (isOpen: boolean) =>
       update($, openAtom, () => ({ conv, keys: Object.fromEntries(files.map(file => [file.key, isOpen])) }))
     const { changed, added, removed } = totals(files)
+    const confirming = reverts !== null && reverts.conv === conv ? reverts.confirm : null
+    const undos = reverts !== null && reverts.conv === conv ? reverts.undo : {}
 
     let budget = RENDER_BUDGET
     const rows = files.slice(0, MAX_FILES_DRAWN).map((file, index) => {
@@ -661,10 +820,11 @@ export const register: Register = on => {
       const fits = cost <= budget
       if (isOpen && fits) budget -= cost
       const arrow = hasBody(file) ? (isOpen ? '▾' : '▸') : '·'
+      const isConfirming = confirming === file.key
 
       return (
         <Box flexDirection="column" marginTop={1}>
-          <Box flexDirection="row" columnGap={1}>
+          <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
             <Button
               plain
               key={`f${index}`}
@@ -675,7 +835,39 @@ export const register: Register = on => {
             <Text color={STATUS_COLOR[file.status]}>{STATUS_LABEL[file.status]}</Text>
             {file.added > 0 && <Text color="success">{`+${file.added}`}</Text>}
             {file.removed > 0 && <Text color="error">{`-${file.removed}`}</Text>}
+            {canExplain(file) && (
+              <Button
+                key={`x${index}`}
+                label="解釋"
+                onPress={() => {
+                  // Off the press: the question is answered in the conversation, not here.
+                  $.clock.after(0, () => void askInChat($, file, running.size > 0))
+                }}
+              />
+            )}
+            {canRevert(file) && !isConfirming && (
+              <Button key={`r${index}`} label="還原" onPress={() => void setRevert($, conv, file.key)} />
+            )}
+            {undos[file.key] !== undefined && (
+              <Button key={`u${index}`} label="復原" onPress={() => void undoRevert($, file.key, conv)} />
+            )}
           </Box>
+          {isConfirming && (
+            <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+              <Text color="warning">
+                {file.status === 'added'
+                  ? `刪除 ${file.rel}？它是這個對話新增的檔案。`
+                  : `把 ${file.rel} 還原成這個對話改之前的內容？`}
+              </Text>
+              <Button
+                key={`rc${index}`}
+                variant="primary"
+                label={file.status === 'added' ? '確定刪除' : '確定還原'}
+                onPress={() => void revertFile($, file.key, conv)}
+              />
+              <Button key={`rn${index}`} label="取消" onPress={() => void setRevert($, conv, null)} />
+            </Box>
+          )}
           {file.note !== null && (isOpen || !hasBody(file)) && <Text dimColor>{file.note}</Text>}
           {isOpen && fits && file.chunks.map(chunk => <Code source={chunk} format="diff" path={file.path} />)}
           {isOpen && fits && file.hiddenLines > 0 && (

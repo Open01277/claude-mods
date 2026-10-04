@@ -46,12 +46,26 @@ export type ConvoDiffOpen = {
   keys: Record<string, boolean>
 }
 
+// What a revert did to one file: its text just before (null: there was no file) and what the revert left (null: removed).
+export type ConvoDiffUndo = {
+  before: string | null
+  after: string | null
+}
+
+export type ConvoDiffReverts = {
+  conv: number
+  // The file whose revert waits for a yes.
+  confirm: string | null
+  undo: Record<string, ConvoDiffUndo>
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'convo-diff': {
       track: ConvoDiffTrack | null
       view: ConvoDiffView | null
       open: ConvoDiffOpen | null
+      revert: ConvoDiffReverts | null
     }
   }
 }
