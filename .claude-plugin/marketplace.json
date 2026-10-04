@@ -10,7 +10,7 @@
       "name": "quota-pets",
       "source": "./plugins/quota-pets",
       "description": "額度寵物扭蛋：每個對話抽一隻顏文字貓或狗，額度快用完會講鬼故事、用完會陣亡、重置後轉生",
-      "version": "0.3.1"
+      "version": "0.4.0"
     },
     {
       "name": "convo-diff",

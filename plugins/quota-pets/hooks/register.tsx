@@ -55,7 +55,8 @@ const previewAtom = atom({ plugin: 'quota-pets', key: 'preview' } as const, null
 const PITY = 30
 const KEEP_LIVES = 50
 const HALF_HOUR = 30 * 60_000
-const WEEK_MS = 7 * 24 * 3600_000
+const DAY_MS = 24 * 3600_000
+const WEEK_MS = 7 * DAY_MS
 
 const whiskers = (face: string) => `(=${face}=)`
 const floppy = (face: string) => `U${face}U`
@@ -635,6 +636,12 @@ function barColor(pct: number): string {
   return pct >= 85 ? 'error' : pct >= 60 ? 'warning' : 'success'
 }
 
+// Which of the week's seven days it is, counted from the last restock.
+function dayOf(left: number): number {
+  return Math.max(0, Math.min(6, Math.floor((WEEK_MS - left) / DAY_MS)))
+}
+
+// The week's food is seven days' worth: the line compares the day being eaten with the day it is.
 function foodLine(week: QuotaPetsLimit, now: number): { text: string; color: string } {
   const left = week.resetsAt === null ? null : Math.max(0, week.resetsAt - now)
   const restock = left === null ? '' : `（${dur(left)}後補貨）`
@@ -642,14 +649,34 @@ function foodLine(week: QuotaPetsLimit, now: number): { text: string; color: str
   if (week.pct >= 100) return { text: `吃光了…這週剩下的日子…牠們要吃什麼…${restock}`, color: 'error' }
   if (week.pct >= 90) return { text: `只剩袋底了…袋子裡…好像有東西在動…${restock}`, color: 'error' }
   if (left === null) return { text: '還夠吃', color: 'success' }
-  const elapsed = WEEK_MS - left
-  if (week.pct <= 0 || elapsed < 3 * 3600_000) return { text: `滿滿一整袋${restock}`, color: 'success' }
-  const toEmpty = ((100 - week.pct) * elapsed) / week.pct
-  if (toEmpty >= left) return { text: `夠吃到補貨${restock}`, color: 'success' }
-  return {
-    text: `照這速度 ${dur(toEmpty)} 後吃光，比補貨早 ${dur(left - toEmpty)}`,
-    color: 'warning',
+  if (week.pct <= 0 || WEEK_MS - left < 3 * 3600_000) return { text: `滿滿一整袋${restock}`, color: 'success' }
+  const eaten = (week.pct * 7) / 100
+  const ahead = Math.floor(eaten) - dayOf(left)
+  // The restock time only shows on the last day, to keep the band short.
+  const tail = left < DAY_MS ? restock : ''
+  if (ahead >= 2) return { text: `偷吃到${ahead === 2 ? '後天' : `${ahead} 天後`}的份了${tail}`, color: 'warning' }
+  if (ahead === 1) return { text: `在偷吃明天的份${tail}`, color: 'warning' }
+  if (left < DAY_MS && 7 - eaten >= 1.5) {
+    return { text: `最後一天還剩 ${Math.round(7 - eaten)} 天份，吃大餐！${restock}`, color: 'success' }
   }
+  if (ahead === 0) return { text: `照進度在吃${tail}`, color: 'success' }
+  return { text: `存了 ${-ahead} 天份${tail}`, color: 'success' }
+}
+
+// The week's food as seven ghosts, one per day, that Pac-Man eats in order; each one eaten leaves a dot.
+// Blue: a day that has come. Dim: a day still ahead. Yellow: a day eaten before it came. Red: the last of the food.
+function lane(week: QuotaPetsLimit, now: number, isScary: boolean): { glyph: string; color?: string }[] {
+  const eaten = Math.min(7, (week.pct * 7) / 100)
+  const done = Math.min(7, Math.floor(eaten + 1e-9))
+  const today = week.resetsAt === null ? 6 : dayOf(Math.max(0, week.resetsAt - now))
+  const dots = Array.from({ length: done }, (_, day) => (day > today ? { glyph: '·', color: 'warning' } : { glyph: '·' }))
+  const ghosts = Array.from({ length: 7 - done }, (_, index) => {
+    const day = done + index
+    if (isScary) return { glyph: 'ᗣ', color: 'error' }
+    if (day <= today) return { glyph: 'ᗣ', color: 'blue' }
+    return eaten > day ? { glyph: 'ᗣ', color: 'warning' } : { glyph: 'ᗣ' }
+  })
+  return [...dots, { glyph: 'ᗧ', color: 'warning' }, ...ghosts]
 }
 
 function critLine(delta: number): string {
@@ -1082,6 +1109,13 @@ export const register: Register = on => {
             {week !== null && food !== null && (
               <Box flexDirection="row" columnGap={1}>
                 <Text dimColor>飼料(週)</Text>
+                <Text>
+                  {lane(week, now, food.color === 'error').map(cell => (
+                    <Text dimColor={cell.color === undefined} {...paint(cell.color)}>
+                      {cell.glyph}
+                    </Text>
+                  ))}
+                </Text>
                 <Text color={food.color}>{pctText(week.pct)}</Text>
                 <Text dimColor wrap="truncate-end">
                   {`· ${food.text}`}

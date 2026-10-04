@@ -4,14 +4,15 @@ import type { On, RenderElement, SessionRateLimit } from 'claude-code'
 
 const NOW = Date.parse('2026-10-03T10:00:00Z')
 const HOUR = 3600_000
+const DAY = 24 * HOUR
 const CATS = ['普通貓', '橘貓', '賓士貓', '鍵盤貓', '實習生貓', '墨鏡貓', '工程師貓', '黑貓', 'PM貓', '招財貓', '太空貓', '薛丁格的貓', '液態貓', '貓神']
 const DOGS = ['米克斯', '柴犬', '臘腸狗', '單身狗', '社畜狗', '哈士奇', '黃金獵犬', '吉娃娃', '舔狗', '看門狗', '狗狗幣', '忠犬八公', '熱狗', '狗頭軍師', '地獄三頭犬', '天狗']
 const START = { cwd: '.', surface: 'terminal', isInteractive: true } as never
 
-function limits(five: number, week: number, fiveResetsAt = NOW + 2 * HOUR): SessionRateLimit[] {
+function limits(five: number, week: number, fiveResetsAt = NOW + 2 * HOUR, weekResetsAt = NOW + 4 * DAY): SessionRateLimit[] {
   return [
     { kind: 'five_hour', percentUsed: five, resetsAt: new Date(fiveResetsAt).toISOString() },
-    { kind: 'seven_day', percentUsed: week, resetsAt: new Date(NOW + 4 * 24 * HOUR).toISOString() },
+    { kind: 'seven_day', percentUsed: week, resetsAt: new Date(weekResetsAt).toISOString() },
   ]
 }
 
@@ -20,6 +21,17 @@ function textOf(node: unknown): string {
   if (node === null || typeof node !== 'object') return ''
   const element = node as RenderElement & { children?: unknown[] }
   return (element.children ?? []).map(textOf).join(' ')
+}
+
+// The week's lane as drawn: each dot, Pac-Man and ghost with its color, or `dim`.
+function laneOf(node: unknown): string[] {
+  if (node === null || typeof node !== 'object') return []
+  const { props, children = [] } = node as { props?: Record<string, unknown>; children?: unknown[] }
+  const [only] = children
+  if (children.length === 1 && typeof only === 'string' && /^[·ᗧᗣ]$/.test(only)) {
+    return [`${only}${props?.dimColor === true ? 'dim' : String(props?.color)}`]
+  }
+  return children.flatMap(laneOf)
 }
 
 const BAND_PROPS = {
@@ -55,9 +67,13 @@ function world(on: On, rateLimits: SessionRateLimit[]) {
   return state
 }
 
-async function band($: Engine, surface: 'terminal' | 'desktop' = 'terminal'): Promise<string> {
+async function draw($: Engine, surface: 'terminal' | 'desktop' = 'terminal'): Promise<unknown> {
   const ui = await $.ui.mount({ plugin: 'quota-pets', surface, component: 'AbovePrompt', props: BAND_PROPS as never })
-  return textOf(await ui.drawn())
+  return ui.drawn()
+}
+
+async function band($: Engine, surface: 'terminal' | 'desktop' = 'terminal'): Promise<string> {
+  return textOf(await draw($, surface))
 }
 
 async function measure($: Engine, rateLimits: SessionRateLimit[]): Promise<void> {
@@ -151,6 +167,49 @@ test('a conversation started after the quota ran out pulls a pet that is dead on
   const drawn = await band($)
   expect(drawn).toContain('100%')
   console.log(drawn)
+})
+
+test('the week is seven ghosts that Pac-Man eats, one per day', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, limits(10, 0))
+  await $.session.start(START)
+
+  // Blue: a day that has come. Dim: one still ahead. Yellow: one eaten before it came. Red: the last of the food.
+  const weeks = [
+    { pct: 60, resetsIn: 5 * DAY, food: '····ᗧᗣᗣᗣ60%·偷吃到後天的份了', lane: '·dim ·dim ·dim ·warning ᗧwarning ᗣwarning ᗣdim ᗣdim' },
+    { pct: 21, resetsIn: 95 * HOUR, food: '·ᗧᗣᗣᗣᗣᗣᗣ21%·存了2天份', lane: '·dim ᗧwarning ᗣblue ᗣblue ᗣblue ᗣdim ᗣdim ᗣdim' },
+    { pct: 40, resetsIn: 98 * HOUR, food: '··ᗧᗣᗣᗣᗣᗣ40%·照進度在吃', lane: '·dim ·dim ᗧwarning ᗣblue ᗣdim ᗣdim ᗣdim ᗣdim' },
+    {
+      pct: 60,
+      resetsIn: 20 * HOUR,
+      food: '····ᗧᗣᗣᗣ60%·最後一天還剩3天份，吃大餐！（20h00m後補貨）',
+      lane: '·dim ·dim ·dim ·dim ᗧwarning ᗣblue ᗣblue ᗣblue',
+    },
+    {
+      pct: 93,
+      resetsIn: 2 * DAY,
+      food: '······ᗧᗣ93%·只剩袋底了…袋子裡…好像有東西在動…（2天後補貨）',
+      lane: '·dim ·dim ·dim ·dim ·dim ·dim ᗧwarning ᗣerror',
+    },
+    {
+      pct: 100,
+      resetsIn: 18 * HOUR,
+      food: '·······ᗧ100%·吃光了…這週剩下的日子…牠們要吃什麼…（18h00m後補貨）',
+      lane: '·dim ·dim ·dim ·dim ·dim ·dim ·dim ᗧwarning',
+    },
+  ]
+  for (const { pct, resetsIn, food, lane } of weeks) {
+    w.rateLimits = limits(10, pct, NOW + 2 * HOUR, NOW + resetsIn)
+    await measure($, w.rateLimits)
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const tree = await draw($, surface)
+      const drawn = textOf(tree)
+      expect(drawn.slice(drawn.indexOf('飼料(週)')).replace(/\s+/g, '')).toBe(`飼料(週)${food}`)
+      expect(laneOf(tree).join(' ')).toBe(lane)
+      if (surface === 'terminal') console.log(drawn)
+    }
+  }
 })
 
 test('every pet draws at every stage of the quota', { timeoutMs: 60_000 }, async ($, on) => {
