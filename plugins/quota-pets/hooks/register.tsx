@@ -12,6 +12,7 @@ import type {
   QuotaPetsScene,
 } from '../types'
 import { biggest, categoryName, mealsOf } from './meals'
+import { parseUsage } from './usage'
 import type { Meal } from './meals'
 
 type Rarity = 'N' | 'R' | 'SR' | 'SSR' | 'UR'
@@ -92,6 +93,7 @@ const previewAtom = atom({ plugin: 'quota-pets', key: 'preview' } as const, null
 const bellyAtom = atom({ plugin: 'quota-pets', key: 'belly' } as const, null)
 const activityAtom = atom({ plugin: 'quota-pets', key: 'activity' } as const, null)
 const foldedAtom = atom({ plugin: 'quota-pets', key: 'folded' } as const, false)
+const probingAtom = atom({ plugin: 'quota-pets', key: 'probing' } as const, false)
 
 // The desktop band's buttons that fold it to one line and back.
 const FOLD = 'fold'
@@ -105,6 +107,14 @@ const HALF_HOUR = 30 * MINUTE
 // count its spending from it.
 const SYNC_MS = 15_000
 const STALE_AFTER = 3 * MINUTE
+// /usage is asked when a conversation opens or is come back to with no reading this fresh, and while every
+// conversation is idle once the shared reading is this old; never twice within PROBE_GAP, across all sessions.
+const PROBE_FRESH = 2 * MINUTE
+const PROBE_IDLE = 10 * MINUTE
+const PROBE_GAP = MINUTE
+const PROBE_TIMEOUT = 30_000
+// Set on the `claude -p /usage` this plugin starts, whose own copy of the plugin then keeps still.
+const PROBE_ENV = 'QUOTA_PETS_PROBE'
 const DAY_MS = 24 * 3600_000
 const WEEK_MS = 7 * DAY_MS
 // Ten quiet minutes is a break; fifty minutes without one and the pet wants a walk, then asks every half hour.
@@ -1139,6 +1149,42 @@ async function recall($: EngineInterface): Promise<void> {
   if (five !== null || week !== null) await update($, limitsAtom, () => ({ five, week, at }))
 }
 
+// Asks /usage in the background, through a `claude -p` of its own, and shares what it says like any reading. Skipped
+// while the shared reading is younger than `fresh`, or another session asked within PROBE_GAP.
+async function probe($: EngineInterface, fresh: number): Promise<void> {
+  const now = await $.clock.now()
+  const kept = (await $.store.get('limits')) as { at?: number } | undefined
+  if (typeof kept?.at === 'number' && now - kept.at < fresh) return
+  const last = (await $.store.get('probe')) as { at?: number } | undefined
+  if (typeof last?.at === 'number' && now - last.at >= 0 && now - last.at < PROBE_GAP) return
+  await $.store.set('probe', { at: now })
+  await update($, probingAtom, () => true)
+  try {
+    const ran = await $.process.run(['claude', '-p', '--no-session-persistence', '--strict-mcp-config', '/usage'], {
+      env: { [PROBE_ENV]: '1' },
+      timeoutMs: PROBE_TIMEOUT,
+    })
+    const read = await $.clock.now()
+    // Off a subscription, or no claude on the PATH: the band waits for an answer, as it always did.
+    const found = ran.exitCode === 0 ? parseUsage(ran.stdout, read) : null
+    if (found === null) return
+    await serial(() => share($, found.five, found.week, read))
+  } catch (error) {
+    $.ui.log(`/usage failed: ${String(error)}`, { to: 'debug' })
+  } finally {
+    await update($, probingAtom, () => false)
+  }
+}
+
+// A reading, from this session's answer or a probe: shown here, and left for the others, unless one is newer.
+async function share($: EngineInterface, five: QuotaPetsLimit | null, week: QuotaPetsLimit | null, at: number): Promise<void> {
+  if (five === null && week === null) return
+  const held = await read($, limitsAtom)
+  if (held === null || (held.at ?? 0) <= at) await update($, limitsAtom, () => ({ five, week, at }))
+  const kept = (await $.store.get('limits')) as { at?: number } | undefined
+  if (typeof kept?.at !== 'number' || kept.at <= at) await $.store.set('limits', { five, week, at })
+}
+
 // A reading this old is no start to count a turn's spending from.
 function ageOf(limits: QuotaPetsLimits | null, now: number): number | null {
   const at = limits?.at
@@ -1149,10 +1195,7 @@ async function ingest($: EngineInterface, rateLimits: readonly SessionRateLimit[
   const five = toLimit(rateLimits.find(limit => limit.kind === 'five_hour'))
   const week = toLimit(rateLimits.find(limit => limit.kind === 'seven_day'))
   const now = await $.clock.now()
-  if (five !== null || week !== null) {
-    await update($, limitsAtom, () => ({ five, week, at: now }))
-    await $.store.set('limits', { five, week, at: now })
-  }
+  await share($, five, week, now)
 
   const { startedAt: conv } = await $.session.usage()
   const save = await load($)
@@ -1484,12 +1527,17 @@ async function startPreview($: EngineInterface, words: readonly string[]): Promi
   return '預覽：從 10% 一路演到陣亡，每 4 秒換一階（只是演的，真實額度沒有動）'
 }
 
+let isProbe = false
+
 export const register: Register = on => {
   let turnStart: { turnId: string; pct: number; window: number | null } | null = null
   // The turns running now: while one runs, the session is at work.
   const running = new Set<string>()
 
   on('session.start', async ($, e, next) => {
+    // The `claude -p /usage` a probe starts: nothing to draw, and no probe of its own.
+    isProbe = (await $.env.get('QUOTA_PETS_PROBE').catch(() => undefined)) === '1'
+    if (isProbe) return next(e)
     await $.command.register({
       name: 'petdex',
       description: '額度寵物圖鑑：抽過的貓狗、陣亡紀錄、保底（試抽／十連／肚子／預覽）',
@@ -1501,9 +1549,13 @@ export const register: Register = on => {
     await serial(() => recall($))
     await serial(() => digest($, usage.context))
     learnLater($)
-    // Another conversation's newer reading, taken up soon after it comes.
+    // A conversation opened with no fresh reading asks /usage, off the start's path.
+    $.clock.after(0, () => void probe($, PROBE_FRESH))
+    // Another conversation's newer reading, taken up soon after it comes; with every conversation idle, /usage now
+    // and then, for what claude.ai or another machine spent.
     $.clock.every(SYNC_MS, () => {
       void serial(() => recall($)).catch(error => $.ui.log(`recall failed: ${String(error)}`, { to: 'debug' }))
+      void probe($, PROBE_IDLE)
     })
     // The countdowns move even when the percent does not, and a run of work grows by the minute.
     $.clock.every(MINUTE, () => {
@@ -1517,7 +1569,9 @@ export const register: Register = on => {
   // The desktop opening this conversation again: what other conversations read meanwhile shows at once.
   on('session.attach', async ($, e, next) => {
     const result = await next(e)
+    if (isProbe) return result
     await serial(() => recall($)).catch(() => undefined)
+    $.clock.after(0, () => void probe($, PROBE_FRESH))
 
     return result
   })
@@ -1623,7 +1677,7 @@ export const register: Register = on => {
     const countdown = countdownOf(five, now)
 
     let face = portrait(pet)
-    let say = '還沒拿到額度資料…跟我說句話吧'
+    let say = (await read($, probingAtom)) ? '查額度中…' : '還沒拿到額度資料…跟我說句話吧'
     let stage: Stage | null = null
     if (five !== null && isOver) {
       face = pick(SPECIES[pet.kind].egg, pet.id, held.since)

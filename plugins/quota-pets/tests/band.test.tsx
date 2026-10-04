@@ -61,6 +61,10 @@ function world(on: On, rateLimits: SessionRateLimit[]) {
     messages: [] as unknown[],
     // What another plugin draws in the band, beneath this one.
     beneath: null as string | null,
+    // What `claude -p /usage` prints; null: it fails, as with no claude on the PATH.
+    usage: null as string | null,
+    probes: [] as { argv: string[]; env?: Record<string, string> }[],
+    commands: [] as string[],
     shown: [] as string[],
   }
   on('session.start', ($, e) => ({ cwd: (e as { cwd: string }).cwd }) as never)
@@ -68,7 +72,11 @@ function world(on: On, rateLimits: SessionRateLimit[]) {
   on('session.compact', () => ({ messages: [SUMMARY], tokensBefore: 165_000, tokensAfter: 21_000 }) as never)
   on('turn.start', ($, e) => ({ turnId: (e as { turnId: string }).turnId }) as never)
   on('turn.complete', () => ({ text: '' }) as never)
-  on('command.register', ($, e) => ({ value: { command: (e as { name: string }).name } }) as never)
+  on('command.register', ($, e) => {
+    state.commands.push((e as { name: string }).name)
+    return { value: { command: (e as { name: string }).name } } as never
+  })
+  on('session.attach', ($, e) => ({ clientId: (e as { clientId: string }).clientId }) as never)
   on('ui.invalidate', () => ({ value: undefined }) as never)
   on('session.messages', () => ({ value: state.messages }) as never)
   on('session.root', () => ({ value: 'D:\\proj' }) as never)
@@ -90,6 +98,12 @@ function world(on: On, rateLimits: SessionRateLimit[]) {
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     return state.beneath === null ? <Box /> : <Text>{state.beneath}</Text>
+  })
+  on('process.run', ($, e) => {
+    const { argv, init } = e as { argv: string[]; init?: { env?: Record<string, string> } }
+    state.probes.push({ argv: [...argv], ...(init?.env === undefined ? {} : { env: init.env }) })
+    const ran = { stdout: state.usage ?? '', stderr: '', exitCode: state.usage === null ? 1 : 0, isStdoutTruncated: false, isStderrTruncated: false }
+    return { value: ran } as never
   })
   on('ui.log', ($, e) => {
     state.shown.push(`log: ${(e as { text: string }).text}`)
@@ -608,25 +622,72 @@ test('a conversation shows the quota other conversations read, opened new or com
   }
 
   // Another conversation gets an answer: this one takes its reading up within seconds, nobody saying a word here.
-  store.set('limits', { five: { pct: 71, resetsAt: NOW + 2 * HOUR }, week: { pct: 33, resetsAt: NOW + 3 * DAY }, at: NOW + 5000 })
+  store.set('limits', { five: { pct: 41, resetsAt: NOW + 2 * HOUR }, week: { pct: 33, resetsAt: NOW + 3 * DAY }, at: NOW + 5000 })
   await clock.advance(15_000)
   let drawn = await band($)
-  expect(drawn).toContain('71%')
+  expect(drawn).toContain('41%')
   expect(drawn).toContain('33%')
 
   // This conversation's own answer is newer still: it shows, and the others will take it up.
   await $.turn.start({ text: 'go', turnId: 't1' } as never)
   await clock.advance(5000)
-  w.rateLimits = limits(74, 34)
+  w.rateLimits = limits(44, 34)
   await measure($, w.rateLimits)
   await $.turn.complete({ turnId: 't1', answer: '', durationMs: 5000, isAborted: false, reason: 'end_turn' } as never)
   drawn = await band($)
-  expect(drawn).toContain('74%')
-  expect((store.get('limits') as { five: { pct: number } }).five.pct).toBe(74)
+  expect(drawn).toContain('44%')
+  expect((store.get('limits') as { five: { pct: number } }).five.pct).toBe(44)
   // An older reading in the store never takes the place of a newer one.
   store.set('limits', { five: { pct: 10, resetsAt: NOW + 2 * HOUR }, week: null, at: NOW })
   await clock.advance(15_000)
-  expect(await band($)).toContain('74%')
-  // The turn counted from 71%, a reading seconds old: +3 is no big bite, so no toast.
+  expect(await band($)).toContain('44%')
+  // The turn counted from 41%, a reading seconds old: +3 is no big bite, so no toast.
   expect(w.shown.filter(text => !text.startsWith('log:'))).toEqual([])
+})
+
+test('a conversation opened with no fresh reading asks /usage in the background, once for every session', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = sharedStore(on, {})
+  const w = world(on, [])
+  const reset = new Date(NOW + 2 * HOUR)
+  const time = (date: Date) => `${date.getHours() % 12 || 12}:${String(date.getMinutes()).padStart(2, '0')}${date.getHours() < 12 ? 'am' : 'pm'}`
+  w.usage = [
+    'Current session: 37% used · resets ' + time(reset),
+    'Current week (all models): 20% used · resets Oct 7, 1am',
+  ].join('\n')
+  await $.session.start(START)
+  await clock.advance(10)
+
+  // The probe is a `claude -p` that keeps no session and starts no MCP server, its own copy of the plugin kept still.
+  expect(w.probes).toHaveLength(1)
+  expect(w.probes[0]?.argv).toEqual(['claude', '-p', '--no-session-persistence', '--strict-mcp-config', '/usage'])
+  expect(w.probes[0]?.env).toEqual({ QUOTA_PETS_PROBE: '1' })
+  const drawn = await band($)
+  expect(drawn).toContain('37%')
+  expect(drawn).toContain('飼料(週)')
+  expect((store.get('limits') as { five: { pct: number } }).five.pct).toBe(37)
+
+  // Come back to within two minutes, or another session starting meanwhile: the reading is fresh, nothing is asked.
+  await $.session.attach({ surface: 'desktop', clientId: 'desktop:default' } as never)
+  await $.session.start(START)
+  await clock.advance(30_000)
+  expect(w.probes).toHaveLength(1)
+
+  // Ten idle minutes later it asks again, for what claude.ai or another machine spent.
+  w.usage = w.usage.replace('37%', '52%')
+  await clock.advance(10 * MINUTE)
+  expect(w.probes).toHaveLength(2)
+  expect(await band($)).toContain('52%')
+  expect(w.shown.filter(text => !text.startsWith('log:'))).toEqual([])
+})
+
+test('the claude a probe starts keeps the plugin still: no probe of its own, no command', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, [])
+  on('env.get', ($, e) => ({ value: (e as { name: string }).name === 'QUOTA_PETS_PROBE' ? '1' : undefined }) as never)
+  w.usage = 'Current session: 37% used'
+  await $.session.start(START)
+  expect(w.probes).toHaveLength(0)
+  expect(w.commands).toEqual([])
 })

@@ -66,6 +66,8 @@ declare module 'claude-code' {
       activity: QuotaPetsActivity | null
       // The band folded to one line, on the desktop; kept in $.store across sessions.
       folded: boolean
+      // A /usage probe is out: the band says the quota is on its way.
+      probing: boolean
     }
   }
 }
