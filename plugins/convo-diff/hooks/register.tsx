@@ -444,7 +444,9 @@ async function refresh($: EngineInterface, keys: ReadonlySet<string> | 'all'): P
     files.push(file)
   }
 
-  $.ui.status(statusLine(files))
+  // The desktop has the band's button instead: the same numbers twice would only repeat themselves.
+  const surfaces = await $.session.surfaces().catch(() => [])
+  $.ui.status(surfaces.includes('desktop') ? undefined : statusLine(files))
   if (prior !== null && prior.conv === track.conv && JSON.stringify(prior.files) === JSON.stringify(files)) return
   const view: ConvoDiffView = { conv: track.conv, at: await $.clock.now(), files }
   await update($, viewAtom, () => view)
@@ -1027,25 +1029,22 @@ export const register: Register = on => {
     )
   })
 
-  // On the desktop, a button above the prompt opens the pane, so there is no /convo-diff to type. What other plugins
-  // draw in the band stays, above it.
+  // On the desktop, a small button above the prompt opens the pane, so there is no /convo-diff to type. It sits to the
+  // right of what other plugins draw in the band.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const beneath = await next(e)
     if (e.surface !== 'desktop' || e.props.hasSurvey) return beneath
     const view = await read($, viewAtom)
-    const { changed, added, removed } = totals(view?.files ?? [])
+    const { changed } = totals(view?.files ?? [])
     if (changed === 0) return beneath
 
-    const { Box, Button, Text } = $.ui.resolve(e)
+    const { Box, Button } = $.ui.resolve(e)
     return (
-      <Box flexDirection="column">
-        {beneath}
-        <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-          <Button key={OPEN} label={TITLE} onPress={() => void openPane($)} />
-          <Text dimColor>{`這個對話改了 ${changed} 個檔案`}</Text>
-          {added > 0 && <Text color="success">{`+${added}`}</Text>}
-          {removed > 0 && <Text color="error">{`-${removed}`}</Text>}
+      <Box flexDirection="row" alignItems="flex-start" columnGap={2}>
+        <Box flexDirection="column" flexGrow={1} flexShrink={1}>
+          {beneath}
         </Box>
+        <Button key={OPEN} label={`${TITLE}（${changed}）`} onPress={() => void openPane($)} />
       </Box>
     )
   })

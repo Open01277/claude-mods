@@ -687,10 +687,11 @@ async function mountBand($: Engine, surface: (typeof SURFACES)[number]) {
   return $.ui.mount({ plugin: 'convo-diff', surface, component: 'AbovePrompt', props: BAND_PROPS as never })
 }
 
-test('on the desktop a button above the prompt opens the pane, under what other plugins draw there', async ($, on) => {
+test('on the desktop a button above the prompt opens the pane, beside what other plugins draw there', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   mock.store(on)
   const w = world(on, { [A]: 'one\n', [B]: 'b\n' })
+  on('session.surfaces', () => ({ value: ['desktop'] }) as never)
   // Another plugin's band beneath this one, as quota-pets draws.
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
     const { Text } = $.ui.resolve(e)
@@ -711,11 +712,10 @@ test('on the desktop a button above the prompt opens the pane, under what other 
   ui = await mountBand($, 'desktop')
   const text = textOf(await ui.drawn())
   expect(text).toContain('橘貓')
-  expect(text).toContain('對話 diff')
-  expect(text).toContain('這個對話改了 2 個檔案')
-  expect(text).toContain('+2')
-  expect(text).toContain('-2')
+  expect(text).toContain('對話 diff（2）')
   expect(text.indexOf('橘貓')).toBeLessThan(text.indexOf('對話 diff'))
+  // The button says it: no status line repeating the numbers under the prompt.
+  expect(w.status).toBeUndefined()
   expect(w.opened).toHaveLength(0)
   await ui.press({ key: 'open' })
   expect(w.opened).toEqual(['convo-diff'])
