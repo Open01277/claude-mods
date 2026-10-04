@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { gitArgv, isLeftover, parseRaw, withEol } from '../hooks/git'
+import { gitArgv, isLeftover, parseRaw, parseTree, sameText, withEol } from '../hooks/git'
 
 const OLD = 'a'.repeat(40)
 const NEW = 'b'.repeat(40)
@@ -61,4 +61,20 @@ test("only this plugin's own indexes, untouched for a day, are leftovers", () =>
 
 test('git runs with its CRLF warnings off', () => {
   expect(gitArgv(['add', '-A'])).toEqual(['git', '-c', 'core.safecrlf=false', 'add', '-A'])
+})
+
+test('ls-tree says the blob each path has in a commit, links and submodules left out', () => {
+  const out = [`100644 blob ${OLD}\tsrc/App.ts`, `100755 blob ${NEW}\tbin/run.sh`, `120000 blob ${NEW}\tlink`, `160000 commit ${OLD}\tvendor`, ''].join('\0')
+  const tree = parseTree(out, path => path.toLowerCase())
+  expect([...tree]).toEqual([
+    ['src/app.ts', OLD],
+    ['bin/run.sh', NEW],
+  ])
+})
+
+test('texts alike but for CRLF are the same; a missing file is only the same as another missing one', () => {
+  expect(sameText('a\r\nb\r\n', 'a\nb\n')).toBe(true)
+  expect(sameText('a\n', 'b\n')).toBe(false)
+  expect(sameText(null, null)).toBe(true)
+  expect(sameText(null, '')).toBe(false)
 })

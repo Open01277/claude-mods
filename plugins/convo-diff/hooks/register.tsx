@@ -4,6 +4,7 @@ import type { EngineInterface, Register, Timer, UiOpenResult } from 'claude-code
 import type {
   ConvoDiffBase,
   ConvoDiffFile,
+  ConvoDiffOpen,
   ConvoDiffStatus,
   ConvoDiffTrack,
   ConvoDiffUndo,
@@ -11,7 +12,7 @@ import type {
 } from '../types'
 import { diffText, isBinary, unapply } from './diff'
 import type { Hunk } from './diff'
-import { gitArgv, isLeftover, parseRaw, withEol } from './git'
+import { gitArgv, isLeftover, parseRaw, parseTree, sameText, withEol } from './git'
 
 const PLUGIN = 'convo-diff'
 const PANE = 'convo-diff'
@@ -61,6 +62,8 @@ const STATUS_COLOR: Record<ConvoDiffStatus, string> = {
 
 type Seen = { kind: 'text'; text: string } | { kind: 'missing' } | { kind: 'error'; reason: string }
 type Found = { base: string | null; isLost: boolean }
+// What a file is compared with: its base, or what the last commit that took it holds.
+type Against = Found & { isCommitted: boolean }
 type BashEdit = { path: string; hunks: Hunk[]; isCreated: boolean; isDeleted: boolean }
 // What the store keeps per conversation, so a resumed conversation finds its files.
 type Kept = { v: 1; at: number; track: ConvoDiffTrack }
@@ -113,6 +116,7 @@ function relOf(path: string, top: string): string | null {
 }
 
 let topCache: string | null = null
+let isGit = false
 
 // The repo this session works in: git's top level above where it started, else that folder itself.
 async function topOf($: EngineInterface): Promise<string> {
@@ -129,6 +133,7 @@ async function topOf($: EngineInterface): Promise<string> {
   const msys = /^\/([A-Za-z])\/(.*)$/.exec(found)
   if (msys !== null && /^[A-Za-z]:/.test(root)) found = `${msys[1]}:/${msys[2]}`
   const isAbove = found !== '' && (keyOf(found) === keyOf(root) || relOf(root, found) !== null)
+  isGit = isAbove
   topCache = isAbove ? found : root
   return topCache
 }
@@ -209,11 +214,12 @@ function isTracked(track: ConvoDiffTrack, path: string): boolean {
   return track.files.some(file => file.key === key)
 }
 
-// The first touch decides a file's base; later touches leave it alone, and files outside the repo never count.
-function withBase(track: ConvoDiffTrack, top: string, path: string, found: Found): ConvoDiffTrack {
+// The first touch decides a file's base, and the HEAD it was taken at; later touches leave them alone, and files
+// outside the repo never count.
+function withBase(track: ConvoDiffTrack, top: string, path: string, found: Found, head: string | null): ConvoDiffTrack {
   if (relOf(path, top) === null || isTracked(track, path)) return track
   const seq = track.seq + 1
-  const file: ConvoDiffBase = { key: keyOf(path), path, base: found.base, isLost: found.isLost, seq }
+  const file: ConvoDiffBase = { key: keyOf(path), path, base: found.base, isLost: found.isLost, seq, head }
   return { ...track, seq, files: [...track.files, file] }
 }
 
@@ -231,6 +237,8 @@ function serial<T>(job: () => Promise<T>): Promise<T> {
 }
 
 const cache = new Map<string, { base: string | null; isLost: boolean; seen: Seen; file: ConvoDiffFile }>()
+// HEAD at the last refresh: when it moves, every file is looked at again.
+let lastHead: string | null | undefined
 
 async function persist($: EngineInterface, track: ConvoDiffTrack): Promise<void> {
   const encoder = new TextEncoder()
@@ -300,12 +308,12 @@ async function adopt($: EngineInterface, track: ConvoDiffTrack, top: string): Pr
           const chain = chains.get(keyOf(path))
           if (chain !== undefined) chain.steps.push(edit.hunks)
           else if (relOf(path, top) === null || isTracked(grown, path)) continue
-          else if (edit.isCreated) grown = withBase(grown, top, path, { base: null, isLost: false })
+          else if (edit.isCreated) grown = withBase(grown, top, path, { base: null, isLost: false }, null)
           else chains.set(keyOf(path), { path, steps: [edit.hunks] })
         }
         for (const changed of edits.more) {
           const path = absolute(changed, cwd)
-          if (!chains.has(keyOf(path))) grown = withBase(grown, top, path, { base: null, isLost: true })
+          if (!chains.has(keyOf(path))) grown = withBase(grown, top, path, { base: null, isLost: true }, null)
         }
         continue
       }
@@ -313,19 +321,19 @@ async function adopt($: EngineInterface, track: ConvoDiffTrack, top: string): Pr
       if (seen === null) continue
       const chain = chains.get(keyOf(seen.path))
       if (chain === undefined) {
-        grown = withBase(grown, top, seen.path, seen.found)
+        grown = withBase(grown, top, seen.path, seen.found, null)
         continue
       }
       // A file tool starts from the text the Bash commands before it left.
       chains.delete(keyOf(seen.path))
-      grown = withBase(grown, top, chain.path, undoChain(chain, seen.found.isLost ? undefined : seen.found.base))
+      grown = withBase(grown, top, chain.path, undoChain(chain, seen.found.isLost ? undefined : seen.found.base), null)
     }
   }
   // Nothing touched these after their commands: they still hold what the commands left.
   for (const chain of chains.values()) {
     const seen = await look($, chain.path)
     const after = seen.kind === 'text' ? seen.text : seen.kind === 'missing' ? null : undefined
-    grown = withBase(grown, top, chain.path, undoChain(chain, after))
+    grown = withBase(grown, top, chain.path, undoChain(chain, after), null)
   }
   return grown
 }
@@ -370,7 +378,95 @@ async function keep($: EngineInterface, before: ConvoDiffTrack, after: ConvoDiff
   await persist($, after)
 }
 
-function describe(base: ConvoDiffBase, seen: Seen, top: string): ConvoDiffFile {
+// HEAD now: a commit id, '' in a repo with no commit yet, null with no repo (or when git cannot say).
+async function headOf($: EngineInterface): Promise<string | null> {
+  const top = await topOf($)
+  if (!isGit) return null
+  try {
+    const ran = await $.process.run(gitArgv(['rev-parse', '--verify', '-q', 'HEAD']), { cwd: top, timeoutMs: GIT_TIMEOUT_MS })
+    const id = ran.stdout.trim()
+    if (ran.exitCode === 0) return /^[0-9a-f]{40,64}$/.test(id) ? id : null
+    return ran.exitCode === 1 ? '' : null
+  } catch {
+    return null
+  }
+}
+
+// What a commit holds is fixed: its blobs by path, and their texts, are read once.
+const treeCache = new Map<string, string | null>()
+const blobCache = new Map<string, string | null>()
+const CACHE_MAX = 2000
+const LS_TREE_PATHS = 50
+
+function cacheSet<V>(cache: Map<string, V>, key: string, value: V): void {
+  if (cache.size >= CACHE_MAX) cache.clear()
+  cache.set(key, value)
+}
+
+// The blob each path has in a commit, or null where it has none.
+async function blobsIn($: EngineInterface, top: string, commit: string, rels: readonly string[]): Promise<Map<string, string | null>> {
+  const fold = (rel: string) => (isWindowsPath(top) ? rel.toLowerCase() : rel)
+  const missing = [...new Set(rels)].filter(rel => !treeCache.has(`${commit}:${rel}`))
+  for (let at = 0; at < missing.length; at += LS_TREE_PATHS) {
+    const some = missing.slice(at, at + LS_TREE_PATHS)
+    const found = parseTree(await gitOut($, top, ['ls-tree', '-r', '-z', commit, '--', ...some]), fold)
+    for (const rel of some) cacheSet(treeCache, `${commit}:${rel}`, found.get(fold(rel)) ?? null)
+  }
+  return new Map(rels.map(rel => [rel, treeCache.get(`${commit}:${rel}`) ?? null]))
+}
+
+// A blob's text, or null when git cannot hand it over whole.
+async function blobText($: EngineInterface, top: string, blob: string): Promise<string | null> {
+  if (!blobCache.has(blob)) cacheSet(blobCache, blob, await gitOut($, top, ['cat-file', 'blob', blob]).catch(() => null))
+  return blobCache.get(blob) ?? null
+}
+
+// What each file is compared with while only what is not committed counts: its base, unless a commit since its
+// first change took it. That is a commit where the file differs from the HEAD it was first changed at; with that
+// HEAD unknown, a HEAD whose file differs from the base. Partial commits, amends and commits from elsewhere all come
+// out the same way, as does a file the commit deleted (null).
+async function againstHead(
+  $: EngineInterface,
+  top: string,
+  bases: readonly ConvoDiffBase[],
+  seen: ReadonlyMap<string, Seen>,
+): Promise<Map<string, Against>> {
+  const out = new Map<string, Against>(bases.map(base => [base.key, { base: base.base, isLost: base.isLost, isCommitted: false }]))
+  const head = await headOf($)
+  if (head === null || head === '') return out
+  const moved = bases.filter(base => base.head !== head && !(base.head == null && base.isLost))
+  if (moved.length === 0) return out
+  const relOfBase = (base: ConvoDiffBase) => relOf(base.path, top) ?? ''
+  try {
+    const now = await blobsIn($, top, head, moved.map(relOfBase))
+    const then = new Map<string, Map<string, string | null>>()
+    for (const base of moved) {
+      if (typeof base.head !== 'string' || base.head === '' || then.has(base.head)) continue
+      const rels = moved.filter(other => other.head === base.head).map(relOfBase)
+      then.set(base.head, await blobsIn($, top, base.head, rels))
+    }
+    for (const base of moved) {
+      const rel = relOfBase(base)
+      const blob = now.get(rel) ?? null
+      const text = blob === null ? null : await blobText($, top, blob)
+      if (blob !== null && text === null) continue
+      if (typeof base.head === 'string') {
+        const before = base.head === '' ? null : (then.get(base.head)?.get(rel) ?? null)
+        if (before === blob) continue
+      } else if (sameText(text, base.base)) {
+        continue
+      }
+      const file = seen.get(base.key)
+      const like = file?.kind === 'text' ? file.text : (base.base ?? '')
+      out.set(base.key, { base: text === null ? null : withEol(text, like), isLost: false, isCommitted: true })
+    }
+  } catch (error) {
+    $.ui.log(`reading HEAD failed: ${reasonOf(error)}`, { to: 'debug' })
+  }
+  return out
+}
+
+function describe(base: ConvoDiffBase, against: Against, seen: Seen, top: string): ConvoDiffFile {
   const file: ConvoDiffFile = {
     key: base.key,
     path: base.path,
@@ -383,12 +479,16 @@ function describe(base: ConvoDiffBase, seen: Seen, top: string): ConvoDiffFile {
     hiddenLines: 0,
     note: null,
     seq: base.seq,
+    isCommitted: against.isCommitted,
   }
-  if (base.isLost) return { ...file, status: 'lost', note: '修改前的內容沒留下來（太大、被 shell 指令改的，或重開後沒保留），沒辦法比對' }
+  if (against.isLost) return { ...file, status: 'lost', note: '修改前的內容沒留下來（太大、被 shell 指令改的，或重開後沒保留），沒辦法比對' }
   if (seen.kind === 'error') return { ...file, status: 'lost', note: `讀不到現在的內容：${seen.reason}` }
 
-  const before = base.base
+  const before = against.base
   const after = seen.kind === 'text' ? seen.text : null
+  if (against.isCommitted && (before === after || (before !== null && after !== null && sameText(before, after)))) {
+    return { ...file, status: 'same', note: '已經 commit 了，之後沒有再改' }
+  }
   if (before === null && after === null) return { ...file, status: 'same', note: '建立之後又刪掉了' }
   if (before === after) return { ...file, status: 'same', note: '改了又改回來，現在跟修改前一樣' }
   const status: ConvoDiffStatus = before === null ? 'added' : after === null ? 'deleted' : 'modified'
@@ -418,38 +518,61 @@ function statusLine(files: readonly ConvoDiffFile[]): string | undefined {
   return `這個對話改了 ${changed} 個檔案 +${added} -${removed}（/${COMMAND} 看 diff）`
 }
 
-// Re-reads the files named (or all of them) and redraws what changed.
+// Re-reads the files named (or all of them) and redraws what changed. A commit since the last look redoes them all.
 async function refresh($: EngineInterface, keys: ReadonlySet<string> | 'all'): Promise<void> {
   const track = await read($, trackAtom)
   if (track === null) return
   const top = await topOf($)
   const prior = await read($, viewAtom)
-  const drawn = new Map((prior?.conv === track.conv ? prior.files : []).map(file => [file.key, file]))
+  const isSame = prior !== null && prior.conv === track.conv
+  const head = await headOf($)
+  const due = head !== lastHead ? 'all' : keys
+  lastHead = head
+  const drawn = new Map((isSame ? prior.files : []).map(file => [file.key, file]))
+  const drawnAll = new Map((isSame ? (prior.all ?? []) : []).map(file => [file.key, file]))
+
+  const bases = inRepo(track, top).files
+  const fresh = bases.filter(base => due === 'all' || due.has(base.key) || !drawn.has(base.key) || !drawnAll.has(base.key))
+  const seen = new Map<string, Seen>()
+  for (const base of fresh) seen.set(base.key, await look($, base.path))
+  const against = await againstHead($, top, fresh, seen)
 
   const files: ConvoDiffFile[] = []
-  for (const base of inRepo(track, top).files) {
+  const all: ConvoDiffFile[] = []
+  for (const base of bases) {
+    const now = seen.get(base.key)
     const old = drawn.get(base.key)
-    if (keys !== 'all' && !keys.has(base.key) && old !== undefined) {
+    const oldAll = drawnAll.get(base.key)
+    if (now === undefined && old !== undefined && oldAll !== undefined) {
       files.push(old)
+      all.push(oldAll)
       continue
     }
-    const seen = await look($, base.path)
-    const hit = cache.get(base.key)
-    if (hit !== undefined && hit.base === base.base && hit.isLost === base.isLost && sameSeen(hit.seen, seen)) {
-      files.push(hit.file)
-      continue
-    }
-    const file = describe(base, seen, top)
-    cache.set(base.key, { base: base.base, isLost: base.isLost, seen, file })
-    files.push(file)
+    const here: Seen = now ?? { kind: 'missing' }
+    const whole = described(base, { base: base.base, isLost: base.isLost, isCommitted: false }, here, top)
+    const since = against.get(base.key)
+    all.push(whole)
+    files.push(since === undefined || !since.isCommitted ? whole : described(base, since, here, top))
   }
 
   // The desktop has the band's button instead: the same numbers twice would only repeat themselves.
   const surfaces = await $.session.surfaces().catch(() => [])
   $.ui.status(surfaces.includes('desktop') ? undefined : statusLine(files))
-  if (prior !== null && prior.conv === track.conv && JSON.stringify(prior.files) === JSON.stringify(files)) return
-  const view: ConvoDiffView = { conv: track.conv, at: await $.clock.now(), files }
+  if (isSame && JSON.stringify(prior.files) === JSON.stringify(files) && JSON.stringify(prior.all) === JSON.stringify(all)) return
+  const view: ConvoDiffView = { conv: track.conv, at: await $.clock.now(), files, all }
   await update($, viewAtom, () => view)
+}
+
+// A file's diff is worked out again only when its text, or what it is compared with, changed.
+function described(base: ConvoDiffBase, against: Against, seen: Seen, top: string): ConvoDiffFile {
+  const key = `${against.isCommitted ? 'c' : 'b'}:${base.key}`
+  const hit = cache.get(key)
+  if (hit !== undefined && hit.base === against.base && hit.isLost === against.isLost && sameSeen(hit.seen, seen)) {
+    return hit.file
+  }
+  const file = describe(base, against, seen, top)
+  cache.set(key, { base: against.base, isLost: against.isLost, seen, file })
+  return file
 }
 
 let pending: Set<string> | 'all' | null = null
@@ -467,18 +590,24 @@ function schedule($: EngineInterface, keys: readonly string[] | 'all'): void {
   })
 }
 
-function patchText(files: readonly ConvoDiffFile[], filter: string): string {
-  const shown = files.filter(file => filter === '' || file.rel.toLowerCase().includes(filter.toLowerCase()))
+function patchText(view: ConvoDiffView | null, filter: string, isAll: boolean): string {
+  const matches = (file: ConvoDiffFile) => filter === '' || file.rel.toLowerCase().includes(filter.toLowerCase())
+  const every = ((isAll ? view?.all : view?.files) ?? []).filter(matches)
+  const committed = isAll ? [] : every.filter(file => file.isCommitted && file.status === 'same')
+  const shown = every.filter(file => !committed.includes(file))
   const { changed, added, removed } = totals(shown)
-  if (shown.length === 0) {
+  if (every.length === 0) {
     return filter === ''
       ? 'convo-diff: this conversation has not changed any file yet.'
       : `convo-diff: no file this conversation changed matches "${filter}".`
   }
   const out = [
-    `convo-diff: ${changed} file(s) changed in this conversation (+${added} -${removed}), each compared with its content before this conversation first changed it.`,
+    isAll
+      ? `convo-diff: ${changed} file(s) changed in this conversation (+${added} -${removed}), each compared with its content before this conversation first changed it, commits or not.`
+      : `convo-diff: ${changed} file(s) this conversation changed that are not committed yet (+${added} -${removed}). A file a commit took since this conversation first changed it is compared with that commit; any other with its content before this conversation first changed it. Pass scope "all" for the whole conversation.`,
   ]
-  let size = out[0]?.length ?? 0
+  if (committed.length > 0) out.push(`# committed, unchanged since: ${committed.map(file => file.rel).join(', ')}`)
+  let size = out.join('\n').length
   for (const file of shown) {
     const lines: string[] = ['']
     if (file.status === 'same' || file.status === 'lost' || file.isBinary) {
@@ -486,6 +615,7 @@ function patchText(files: readonly ConvoDiffFile[], filter: string): string {
     } else {
       lines.push(file.status === 'added' ? '--- /dev/null' : `--- a/${file.rel}`)
       lines.push(file.status === 'deleted' ? '+++ /dev/null' : `+++ b/${file.rel}`)
+      if (file.isCommitted) lines.push('# against the last commit that took it')
       if (file.note !== null) lines.push(`# ${file.note}`)
       lines.push(...file.chunks)
       if (file.hiddenLines > 0) lines.push(`# ... ${file.hiddenLines} more diff lines not shown`)
@@ -501,6 +631,11 @@ function patchText(files: readonly ConvoDiffFile[], filter: string): string {
   return out.join('\n')
 }
 
+// Files a commit took that have not changed since: the pane lists them on one line.
+function committedOf(view: ConvoDiffView | null): ConvoDiffFile[] {
+  return (view?.files ?? []).filter(file => file.isCommitted && file.status === 'same')
+}
+
 function canExplain(file: ConvoDiffFile): boolean {
   return file.chunks.length > 0 && !file.isBinary
 }
@@ -512,7 +647,7 @@ function canRevert(file: ConvoDiffFile): boolean {
 
 // The question the Explain button sends: answered in the conversation, where it can be followed up, by the
 // session's own model, which reads the net change through this plugin's tool rather than a pasted copy.
-function explainPrompt(file: ConvoDiffFile): string {
+function explainPrompt(file: ConvoDiffFile, isAll: boolean): string {
   const path = `\`${file.rel}\``
   const ask =
     file.status === 'added'
@@ -520,15 +655,17 @@ function explainPrompt(file: ConvoDiffFile): string {
       : file.status === 'deleted'
         ? `請解釋這個對話為什麼刪除 ${path}，刪掉之後有什麼要注意的。`
         : `請解釋這個對話對 ${path} 做的改動：改了什麼、為什麼這樣改、有什麼要注意的。`
-  return `${ask}要看它在這個對話裡的淨改動，可以用 ${TOOL} 工具（path 填 ${file.rel}）。只要解釋，不要修改任何檔案。`
+  const how = isAll ? `path 填 ${file.rel}，scope 填 all` : `path 填 ${file.rel}`
+  const since = !isAll && file.isCommitted ? '已經 commit 的部分不用講，只解釋 commit 之後的改動。' : ''
+  return `${ask}${since}要看它在這個對話裡的淨改動，可以用 ${TOOL} 工具（${how}）。只要解釋，不要修改任何檔案。`
 }
 
 // Sent as the person's own question, since they pressed for it. It starts a turn of its own once the session is
 // idle, and the call resolves only then: the toast comes first.
-async function askInChat($: EngineInterface, file: ConvoDiffFile, isBusy: boolean): Promise<void> {
+async function askInChat($: EngineInterface, file: ConvoDiffFile, isBusy: boolean, isAll: boolean): Promise<void> {
   $.ui.toast(isBusy ? `Claude 這回合結束後會解釋 ${file.rel}` : `已請 Claude 解釋 ${file.rel}`)
   try {
-    await $.prompt.submit({ text: explainPrompt(file), asUser: true })
+    await $.prompt.submit({ text: explainPrompt(file, isAll), asUser: true })
   } catch (error) {
     $.ui.toast(`沒辦法送出解釋的問題：${reasonOf(error)}`)
   }
@@ -622,7 +759,7 @@ async function snap($: EngineInterface): Promise<Snap | null> {
 
 // The files a command changed between two snapshots. A file's first touch takes its base from the snapshot before:
 // git's blob, with the line endings the file has now.
-async function trackSnapshots($: EngineInterface, before: Snap, after: Snap): Promise<void> {
+async function trackSnapshots($: EngineInterface, before: Snap, after: Snap, head: string | null): Promise<void> {
   if (after.tree === before.tree) return
   const raw = await gitOut($, before.top, ['diff-tree', '-r', '-z', '--raw', '--no-renames', before.tree, after.tree])
   const track = await ensure($)
@@ -633,7 +770,7 @@ async function trackSnapshots($: EngineInterface, before: Snap, after: Snap): Pr
     const path = `${before.top.replace(/[\\/]+$/, '')}/${file.rel}`
     if (relOf(path, top) === null || isTracked(grown, path)) continue
     if (file.before === null) {
-      grown = withBase(grown, top, path, { base: null, isLost: false })
+      grown = withBase(grown, top, path, { base: null, isLost: false }, head)
       continue
     }
     bases += 1
@@ -642,7 +779,7 @@ async function trackSnapshots($: EngineInterface, before: Snap, after: Snap): Pr
       bases > SNAP_MAX_BASES ? null : await gitOut($, before.top, ['cat-file', 'blob', file.before]).catch(() => null)
     const seen = text === null ? null : await look($, path)
     const base = text === null ? null : seen?.kind === 'text' ? withEol(text, seen.text) : text
-    grown = withBase(grown, top, path, { base, isLost: base === null })
+    grown = withBase(grown, top, path, { base, isLost: base === null }, head)
   }
   await keep($, track, grown)
 }
@@ -675,21 +812,26 @@ async function fileOf($: EngineInterface, key: string, conv: number): Promise<{ 
   return { base, rel: relOf(base.path, await topOf($)) ?? normalize(base.path) }
 }
 
-// Puts a file back as it was before this conversation first changed it, keeping what it replaced for an undo.
+// Puts a file back as what the pane compares it with: the last commit that took it, else how it was before this
+// conversation first changed it. Never further back than a commit: what is committed (or pushed) stays. What it
+// replaced is kept for an undo.
 async function revertFile($: EngineInterface, key: string, conv: number): Promise<void> {
   await setRevert($, conv, null)
   const found = await fileOf($, key, conv)
-  if (found === null || found.base.isLost) return
-  const { base, rel } = found
-  const seen = await look($, base.path)
+  if (found === null) return
+  const { base: file, rel } = found
+  const seen = await look($, file.path)
   if (seen.kind === 'error') {
     $.ui.toast(`沒辦法還原 ${rel}：${seen.reason}`)
     return
   }
+  const top = await topOf($)
+  const base = (await againstHead($, top, [file], new Map([[key, seen]]))).get(key)
+  if (base === undefined || base.isLost) return
   const before = seen.kind === 'text' ? seen.text : null
   try {
-    if (base.base !== null) await $.fs.write(base.path, base.base)
-    else if (before !== null) await removeFile($, base.path)
+    if (base.base !== null) await $.fs.write(file.path, base.base)
+    else if (before !== null) await removeFile($, file.path)
   } catch (error) {
     $.ui.toast(`沒辦法還原 ${rel}：${reasonOf(error)}`)
     return
@@ -700,13 +842,23 @@ async function revertFile($: EngineInterface, key: string, conv: number): Promis
     else delete undo[key]
     return undo
   })
-  const done = base.base === null ? `已刪除 ${rel}（這個對話新增的檔案）` : `已把 ${rel} 還原成這個對話改之前的樣子`
+  const done = base.isCommitted
+    ? base.base === null
+      ? `已刪除 ${rel}（上次 commit 裡沒有它）`
+      : `已把 ${rel} 還原成上次 commit 的樣子`
+    : base.base === null
+      ? `已刪除 ${rel}（這個對話新增的檔案）`
+      : `已把 ${rel} 還原成這個對話改之前的樣子`
   $.ui.toast(canUndo ? done : `${done}；檔案太大，沒辦法復原`)
   await tellModel(
     $,
-    base.base === null
-      ? `[convo-diff] 我在 diff 面板把 ${rel} 還原了：它是這個對話新增的檔案，現在已經刪除。`
-      : `[convo-diff] 我在 diff 面板把 ${rel} 還原成這個對話第一次修改它之前的內容，這個對話對它的修改都不在了。之後要改它請先重新讀取。`,
+    base.isCommitted
+      ? base.base === null
+        ? `[convo-diff] 我在 diff 面板把 ${rel} 刪掉了：上次 commit 裡沒有它，commit 之後的修改都不在了。`
+        : `[convo-diff] 我在 diff 面板把 ${rel} 還原成上次 commit 的內容，commit 之後對它的修改都不在了（已經 commit 的不受影響）。之後要改它請先重新讀取。`
+      : base.base === null
+        ? `[convo-diff] 我在 diff 面板把 ${rel} 還原了：它是這個對話新增的檔案，現在已經刪除。`
+        : `[convo-diff] 我在 diff 面板把 ${rel} 還原成這個對話第一次修改它之前的內容，這個對話對它的修改都不在了。之後要改它請先重新讀取。`,
   )
   schedule($, [key])
 }
@@ -755,10 +907,17 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'diff',
       description:
-        "The net unified diff of every file in this repo that this conversation changed (Edit, Write, NotebookEdit, Bash edits the engine tracked, and PowerShell commands, from git snapshots of the work tree around each), each file compared with its content before this conversation first changed it. Changes made outside this conversation to files it never touched are left out. Use it to review, summarize or commit only this conversation's changes.",
+        "The net unified diff of the files in this repo that this conversation changed (Edit, Write, NotebookEdit, Bash edits the engine tracked, and PowerShell commands, from git snapshots of the work tree around each). By default only what is not committed yet: a file a commit took since this conversation first changed it is compared with that commit, any other with its content before this conversation first changed it. With scope \"all\", the whole conversation, each file against its content before this conversation first changed it, commits or not. Changes made outside this conversation to files it never touched are left out. Use it to review, summarize or commit only this conversation's changes.",
       inputSchema: {
         type: 'object',
-        properties: { path: { type: 'string', description: 'Only files whose path contains this text.' } },
+        properties: {
+          path: { type: 'string', description: 'Only files whose path contains this text.' },
+          scope: {
+            type: 'string',
+            enum: ['pending', 'all'],
+            description: 'pending (the default): what is not committed yet. all: the whole conversation.',
+          },
+        },
       },
     })
     // The transcript may be long: catching up on it waits for no prompt.
@@ -776,6 +935,7 @@ export const register: Register = on => {
     if (e.reason === 'clear') {
       await serial(async () => {
         cache.clear()
+        lastHead = undefined
         await update($, trackAtom, () => null)
         await update($, viewAtom, () => null)
         await update($, revertAtom, () => null)
@@ -789,6 +949,8 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     running.add(e.turnId)
     await serial(() => ensure($)).catch(() => undefined)
+    // A commit made elsewhere (the person's own terminal) shows by the next turn.
+    schedule($, 'all')
 
     return next(e)
   })
@@ -809,7 +971,7 @@ export const register: Register = on => {
     // Read before the first touch: the record afterwards cannot tell a new file from one too large to copy.
     const before = await serial(async () => {
       const track = await ensure($)
-      return isTracked(track, path) ? null : look($, path)
+      return isTracked(track, path) ? null : { seen: await look($, path), head: await headOf($) }
     }).catch(() => null)
 
     const ran = await next(e)
@@ -819,14 +981,14 @@ export const register: Register = on => {
       const track = await ensure($)
       const own = foundIn(e.tool, ran.result)?.found
       const found: Found =
-        before?.kind === 'missing'
+        before?.seen.kind === 'missing'
           ? { base: null, isLost: false }
           : own !== undefined && own.base !== null
             ? own
-            : before?.kind === 'text'
-              ? { base: before.text, isLost: false }
+            : before?.seen.kind === 'text'
+              ? { base: before.seen.text, isLost: false }
               : (own ?? { base: null, isLost: true })
-      await keep($, track, withBase(track, top, path, found))
+      await keep($, track, withBase(track, top, path, found, before?.head ?? null))
     }).catch(error => $.ui.log(`tracking ${path} failed: ${reasonOf(error)}`, { to: 'debug' }))
     schedule($, [keyOf(path)])
 
@@ -834,6 +996,8 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    // Before the command: one that changes files and commits them leaves them compared with that commit.
+    const head = await serial(() => headOf($)).catch(() => null)
     const ran = await next(e)
     if (ran.deny !== undefined || ran.isError === true || ran.isReadOnly === true) return ran
 
@@ -848,17 +1012,17 @@ export const register: Register = on => {
           const path = absolute(edit.path, cwd)
           if (relOf(path, top) === null || isTracked(grown, path)) continue
           if (edit.isCreated) {
-            grown = withBase(grown, top, path, { base: null, isLost: false })
+            grown = withBase(grown, top, path, { base: null, isLost: false }, head)
             continue
           }
           const seen: Seen = edit.isDeleted ? { kind: 'missing' } : await look($, path)
           const after = seen.kind === 'text' ? seen.text : seen.kind === 'missing' ? '' : null
           const base = after === null || edit.hunks.length === 0 ? null : unapply(after, edit.hunks)
-          grown = withBase(grown, top, path, { base, isLost: base === null })
+          grown = withBase(grown, top, path, { base, isLost: base === null }, head)
         }
         for (const changed of edits.more) {
           const path = absolute(changed, cwd)
-          grown = withBase(grown, top, path, { base: null, isLost: true })
+          grown = withBase(grown, top, path, { base: null, isLost: true }, head)
         }
         await keep($, track, grown)
       }).catch(error => $.ui.log(`tracking a Bash command failed: ${reasonOf(error)}`, { to: 'debug' }))
@@ -871,7 +1035,7 @@ export const register: Register = on => {
 
   // PowerShell's record names no files: snapshots of the work tree before and after the command tell which changed.
   on('tool.call', { tool: 'PowerShell' }, async ($, e, next) => {
-    const before = await serial(() => snap($)).catch(error => {
+    const before = await serial(async () => ({ snap: await snap($), head: await headOf($) })).catch(error => {
       $.ui.log(`snapshot before a PowerShell command failed: ${reasonOf(error)}`, { to: 'debug' })
       return null
     })
@@ -879,10 +1043,11 @@ export const register: Register = on => {
     // Refused, or read-only as the engine judged it. One that failed may still have changed files.
     if (ran.deny !== undefined || ran.isReadOnly === true) return ran
 
-    if (before !== null) {
+    if (before !== null && before.snap !== null) {
+      const { snap: first, head } = before
       await serial(async () => {
         const after = await snap($)
-        if (after !== null) await trackSnapshots($, before, after)
+        if (after !== null) await trackSnapshots($, first, after, head)
       }).catch(error => $.ui.log(`tracking a PowerShell command failed: ${reasonOf(error)}`, { to: 'debug' }))
     }
     schedule($, 'all')
@@ -898,7 +1063,7 @@ export const register: Register = on => {
     const view = await read($, viewAtom)
     const filter = typeof e.path === 'string' ? e.path.trim() : ''
 
-    return { result: patchText(view?.files ?? [], filter) }
+    return { result: patchText(view, filter, e.scope === 'all') }
   })
 
   on('command.run', { command: COMMAND }, async $ => {
@@ -908,8 +1073,14 @@ export const register: Register = on => {
     })
     const view = await read($, viewAtom)
     const { changed, added, removed } = totals(view?.files ?? [])
+    const committed = committedOf(view).length
     const opened = await openPane($)
-    const head = changed === 0 ? '這個對話還沒有改任何檔案' : `這個對話改了 ${changed} 個檔案（+${added} -${removed}）`
+    const head =
+      changed > 0
+        ? `這個對話改了 ${changed} 個檔案（+${added} -${removed}）${committed > 0 ? `，不算已經 commit 的 ${committed} 個` : ''}`
+        : committed > 0
+          ? `這個對話改的 ${committed} 個檔案都 commit 了`
+          : '這個對話還沒有改任何檔案'
 
     return { text: opened.isPlaced ? `${head}，diff 在面板裡。` : `${head}；面板還沒顯示：${opened.reason}` }
   })
@@ -919,34 +1090,40 @@ export const register: Register = on => {
     const view = await read($, viewAtom)
     const open = await read($, openAtom)
     const reverts = await read($, revertAtom)
-    const files = view?.files ?? []
 
-    if (view === null || files.length === 0) {
+    if (view === null || view.all.length === 0) {
       return (
         <Box flexDirection="column">
           <Text>這個對話還沒有改任何檔案。</Text>
           <Text dimColor>
-            之後用 Edit、Write、NotebookEdit 或 Bash 改到 repo 裡的檔案會列在這裡，每個檔案都跟它在這個對話第一次被改之前的內容比。
+            之後用 Edit、Write、NotebookEdit 或 Bash 改到 repo 裡的檔案會列在這裡，每個檔案都跟它在這個對話第一次被改之前的內容比；commit 過的就改跟那次 commit 比。
           </Text>
         </Box>
       )
     }
 
     const conv = view.conv
+    const isAll = open !== null && open.conv === conv && open.isAll === true
+    const committed = isAll ? [] : committedOf(view)
+    const files = (isAll ? view.all : view.files).filter(file => !committed.includes(file))
     const hasBody = (file: ConvoDiffFile) => file.chunks.length > 0
     const choiceOf = (file: ConvoDiffFile) => (open !== null && open.conv === conv ? open.keys[file.key] : undefined)
     const isOpenOf = (file: ConvoDiffFile) => hasBody(file) && choiceOf(file) !== false
     const anyOpen = files.some(isOpenOf)
-    const toggle = (file: ConvoDiffFile) =>
-      update($, openAtom, held => {
-        const keys = held !== null && held.conv === conv ? held.keys : {}
-        return { conv, keys: { ...keys, [file.key]: keys[file.key] === false } }
-      })
-    const setAll = (isOpen: boolean) =>
-      update($, openAtom, () => ({ conv, keys: Object.fromEntries(files.map(file => [file.key, isOpen])) }))
+    const setOpen = (change: (held: ConvoDiffOpen) => ConvoDiffOpen) =>
+      update($, openAtom, held => change(held !== null && held.conv === conv ? held : { conv, keys: {} }))
+    const toggle = (file: ConvoDiffFile) => setOpen(held => ({ ...held, keys: { ...held.keys, [file.key]: held.keys[file.key] === false } }))
+    const setAll = (isOpen: boolean) => setOpen(held => ({ ...held, keys: Object.fromEntries(files.map(file => [file.key, isOpen])) }))
     const { changed, added, removed } = totals(files)
     const confirming = reverts !== null && reverts.conv === conv ? reverts.confirm : null
     const undos = reverts !== null && reverts.conv === conv ? reverts.undo : {}
+    const title = isAll
+      ? `整段對話改了 ${changed} 個檔案`
+      : changed > 0
+        ? `這個對話改了 ${changed} 個檔案`
+        : committed.length > 0
+          ? '這個對話的改動都 commit 了'
+          : '這個對話改過的檔案現在都跟原本一樣'
 
     let budget = RENDER_BUDGET
     const rows = files.slice(0, MAX_FILES_DRAWN).map((file, index) => {
@@ -955,7 +1132,15 @@ export const register: Register = on => {
       const fits = cost <= budget
       if (isOpen && fits) budget -= cost
       const arrow = hasBody(file) ? (isOpen ? '▾' : '▸') : '·'
-      const isConfirming = confirming === file.key
+      const isConfirming = !isAll && confirming === file.key
+      const question =
+        file.status === 'added'
+          ? file.isCommitted
+            ? `刪除 ${file.rel}？上次 commit 裡沒有它。`
+            : `刪除 ${file.rel}？它是這個對話新增的檔案。`
+          : file.isCommitted
+            ? `把 ${file.rel} 還原成上次 commit 的內容？已經 commit 的改動不受影響。`
+            : `把 ${file.rel} 還原成這個對話改之前的內容？`
 
       return (
         <Box flexDirection="column" marginTop={1}>
@@ -970,17 +1155,18 @@ export const register: Register = on => {
             <Text color={STATUS_COLOR[file.status]}>{STATUS_LABEL[file.status]}</Text>
             {file.added > 0 && <Text color="success">{`+${file.added}`}</Text>}
             {file.removed > 0 && <Text color="error">{`-${file.removed}`}</Text>}
+            {!isAll && file.isCommitted && file.status !== 'same' && <Text dimColor>（跟上次 commit 比）</Text>}
             {canExplain(file) && (
               <Button
                 key={`x${index}`}
                 label="解釋"
                 onPress={() => {
                   // Off the press: the question is answered in the conversation, not here.
-                  $.clock.after(0, () => void askInChat($, file, running.size > 0))
+                  $.clock.after(0, () => void askInChat($, file, running.size > 0, isAll))
                 }}
               />
             )}
-            {canRevert(file) && !isConfirming && (
+            {!isAll && canRevert(file) && !isConfirming && (
               <Button key={`r${index}`} label="還原" onPress={() => void setRevert($, conv, file.key)} />
             )}
             {undos[file.key] !== undefined && (
@@ -989,11 +1175,7 @@ export const register: Register = on => {
           </Box>
           {isConfirming && (
             <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-              <Text color="warning">
-                {file.status === 'added'
-                  ? `刪除 ${file.rel}？它是這個對話新增的檔案。`
-                  : `把 ${file.rel} 還原成這個對話改之前的內容？`}
-              </Text>
+              <Text color="warning">{question}</Text>
               <Button
                 key={`rc${index}`}
                 variant="primary"
@@ -1016,13 +1198,26 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-          <Text bold>{changed === 0 ? '這個對話改過的檔案現在都跟原本一樣' : `這個對話改了 ${changed} 個檔案`}</Text>
+          <Text bold>{title}</Text>
           {added > 0 && <Text color="success">{`+${added}`}</Text>}
           {removed > 0 && <Text color="error">{`-${removed}`}</Text>}
+          <Button
+            key="scope"
+            label={isAll ? '只看還沒 commit 的' : '看整段對話'}
+            onPress={() => void setOpen(held => ({ ...held, isAll: !isAll }))}
+          />
           <Button key="refresh" label="重新整理" onPress={() => void serial(() => refresh($, 'all'))} />
           <Button key="fold" label={anyOpen ? '全部收合' : '全部展開'} onPress={() => setAll(!anyOpen)} />
           <Button key="close" role="dismiss" label="關閉" onPress={() => void $.ui.close({ id: PANE })} />
         </Box>
+        {isAll && (
+          <Text dimColor>整段對話：每個檔案跟這個對話第一次改它之前比，commit 過的也算。這裡只能看，要還原請切回「只看還沒 commit 的」。</Text>
+        )}
+        {committed.length > 0 && (
+          <Text dimColor wrap="truncate-end">
+            {`已經 commit、之後沒再改（${committed.length}）：${committed.map(file => file.rel).join('、')}`}
+          </Text>
+        )}
         {rows}
         {files.length > MAX_FILES_DRAWN && <Text dimColor>{`… 還有 ${files.length - MAX_FILES_DRAWN} 個檔案沒列出來`}</Text>}
       </Box>
@@ -1036,7 +1231,9 @@ export const register: Register = on => {
     if (e.surface !== 'desktop' || e.props.hasSurvey) return beneath
     const view = await read($, viewAtom)
     const { changed } = totals(view?.files ?? [])
-    if (changed === 0) return beneath
+    // Everything committed: the button stays, to reach the whole conversation, and says so.
+    const isCommitted = changed === 0 && committedOf(view).length > 0
+    if (changed === 0 && !isCommitted) return beneath
 
     const { Box, Button } = $.ui.resolve(e)
     return (
@@ -1044,7 +1241,7 @@ export const register: Register = on => {
         <Box flexDirection="column" flexGrow={1} flexShrink={1}>
           {beneath}
         </Box>
-        <Button key={OPEN} label={`${TITLE}（${changed}）`} onPress={() => void openPane($)} />
+        <Button key={OPEN} label={`${TITLE}（${isCommitted ? '都 commit 了' : changed}）`} onPress={() => void openPane($)} />
       </Box>
     )
   })

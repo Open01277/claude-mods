@@ -44,3 +44,22 @@ export function withEol(text: string, like: string): string {
 export function isLeftover(name: string, mtimeMs: number, now: number): boolean {
   return INDEX_NAME.test(name) && now - mtimeMs > DAY_MS
 }
+
+// `git ls-tree -r -z <commit> -- <paths>`: `<mode> <type> <blob>`, TAB, the path, NUL; per file. Regular files only,
+// keyed by path (folded to lower case where the repo ignores case).
+export function parseTree(out: string, fold: (path: string) => string): Map<string, string> {
+  const blobs = new Map<string, string>()
+  for (const entry of out.split('\0')) {
+    const tab = entry.indexOf('\t')
+    const head = /^(\d{6}) blob ([0-9a-f]+)$/.exec(entry.slice(0, tab))
+    if (tab < 0 || head === null || !isFile(head[1] ?? '')) continue
+    blobs.set(fold(entry.slice(tab + 1)), head[2] ?? '')
+  }
+  return blobs
+}
+
+// Two texts alike but for their line endings: a blob holds LF where the file may hold CRLF.
+export function sameText(a: string | null, b: string | null): boolean {
+  if (a === null || b === null) return a === b
+  return a.replace(/\r\n/g, '\n') === b.replace(/\r\n/g, '\n')
+}

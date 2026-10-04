@@ -7,6 +7,9 @@ export type ConvoDiffBase = {
   // The content before could not be kept (too large, unreadable, or dropped from the store).
   isLost: boolean
   seq: number
+  // HEAD when the conversation first changed the file: '' with no commit yet, null or absent when unknown (a file
+  // read back from the transcript, or kept by an older version). A commit since that took the file moves its base.
+  head?: string | null
 }
 
 // Keyed by the conversation's start (`$.session.usage().startedAt`), which a /clear moves.
@@ -32,18 +35,25 @@ export type ConvoDiffFile = {
   hiddenLines: number
   note: string | null
   seq: number
+  // Compared with a commit that took this conversation's changes to it, not with the file before the conversation.
+  isCommitted: boolean
 }
 
 export type ConvoDiffView = {
   conv: number
   at: number
+  // What is not committed yet: each file against the last commit that took it, else its base.
   files: ConvoDiffFile[]
+  // The whole conversation: each file against its base, commits or not.
+  all: ConvoDiffFile[]
 }
 
 // The person's expand/collapse choices in the pane, by file key.
 export type ConvoDiffOpen = {
   conv: number
   keys: Record<string, boolean>
+  // The pane shows the whole conversation, to read only, instead of what is not committed yet.
+  isAll?: boolean
 }
 
 // What a revert did to one file: its text just before (null: there was no file) and what the revert left (null: removed).

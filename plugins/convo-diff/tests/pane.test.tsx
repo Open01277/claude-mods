@@ -132,15 +132,21 @@ function world(on: On, files: Readonly<Record<string, string>>, root = ROOT): Wo
   return w
 }
 
-type Git = { indexes: Set<string>; calls: string[][] }
+type Git = {
+  indexes: Set<string>
+  calls: string[][]
+  // Commits the files named (all of them by default) as they are now, on top of HEAD.
+  commit: (paths?: readonly string[]) => string
+}
 
 // Git beneath the plugin, over the world's files: `add -A` and `write-tree` hash them into trees, `diff-tree` and
 // `cat-file` read those back. Blobs store LF, as core.autocrlf does on Windows.
 function fakeGit(on: On, w: World, top = 'D:/proj'): Git {
-  const git: Git = { indexes: new Set(), calls: [] }
   const ids = new Map<string, string>()
   const blobs = new Map<string, string>()
   const trees = new Map<string, Map<string, string>>()
+  const commits = new Map<string, Map<string, string>>()
+  let head: string | null = null
   let staged = new Map<string, string>()
   const idOf = (key: string) => {
     const id = ids.get(key) ?? (ids.size + 1).toString(16).padStart(40, '0')
@@ -149,6 +155,29 @@ function fakeGit(on: On, w: World, top = 'D:/proj'): Git {
   }
   const said = (stdout: string, exitCode = 0) => ({ value: { ...RAN, stdout, exitCode } }) as never
   const prefix = `${top.toLowerCase()}/`
+  const git: Git = {
+    indexes: new Set(),
+    calls: [],
+    commit: paths => {
+      const tree = new Map(head === null ? [] : (commits.get(head) ?? []))
+      const named = paths === undefined ? [...w.files.keys()].filter(path => path.startsWith(prefix)) : paths.map(spelled)
+      for (const path of named) {
+        const text = w.files.get(path)
+        const rel = path.slice(prefix.length)
+        if (text === undefined) {
+          tree.delete(rel)
+          continue
+        }
+        const blob = text.replace(/\r\n/g, '\n')
+        const id = idOf(`blob:${blob}`)
+        blobs.set(id, blob)
+        tree.set(rel, id)
+      }
+      head = idOf(`commit:${commits.size}`)
+      commits.set(head, tree)
+      return head
+    },
+  }
   on('fs.list', () => ({ value: [] }) as never)
   on('process.run', ($, e) => {
     const { argv, init } = e as { argv: string[]; init?: { env?: Record<string, string> } }
@@ -160,6 +189,13 @@ function fakeGit(on: On, w: World, top = 'D:/proj'): Git {
     // Every snapshot goes through an index; nothing else is run on one.
     if ((args[0] === 'add' || args[0] === 'write-tree') !== (index !== undefined)) return said('', 128)
     const [verb, ...rest] = args
+    if (verb === 'rev-parse' && rest.includes('HEAD')) return head === null ? said('', 1) : said(`${head}\n`)
+    if (verb === 'ls-tree') {
+      const [, , commit = '', , ...paths] = rest
+      const tree = commits.get(commit)
+      if (tree === undefined) return said('', 128)
+      return said(paths.filter(rel => tree.has(rel)).map(rel => `100644 blob ${tree.get(rel)}\t${rel}\0`).join(''))
+    }
     if (verb === 'rev-parse') return said(rest[0] === '--show-toplevel' ? `${top}\n` : `${top}/.git\n`)
     if (verb === 'add') {
       staged = new Map()
@@ -726,4 +762,122 @@ test('on the desktop a button above the prompt opens the pane, beside what other
   expect(await ui.find({ key: 'open' })).toBeUndefined()
   expect(textOf(await ui.drawn())).toContain('橘貓')
   await ui.unmount()
+})
+
+async function patchOf($: Engine, input: Record<string, string> = {}): Promise<string> {
+  return String(((await $.tool.call({ tool: 'mcp__convo-diff__diff', ...input } as never)) as { result?: unknown }).result)
+}
+
+test('after a commit only what is not committed shows; the whole conversation is a click away, to read only', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, { [A]: 'one\ntwo\n', [B]: 'b\n' })
+  const git = fakeGit(on, w)
+  // The engine draws nothing of its own in the band.
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box />
+  })
+  git.commit()
+  await $.session.start(START)
+  await clock.advance(1000)
+
+  await edit($, A, 'two', 'TWO')
+  await edit($, B, 'b', 'bee')
+  // Claude commits: the command moves HEAD, and the diff follows it.
+  git.commit()
+  await $.tool.call({ tool: 'Bash', command: 'git commit -am "two and bee"' } as never)
+  await edit($, A, 'one', 'ONE')
+  await clock.advance(1000)
+
+  let text = await drawn($)
+  expect(text).toContain('這個對話改了 1 個檔案')
+  expect(text).toContain('-one')
+  expect(text).toContain('+ONE')
+  expect(text).not.toContain('-two')
+  expect(text).toContain('跟上次 commit 比')
+  expect(text).toContain('已經 commit、之後沒再改（1）：b.txt')
+  expect(w.status).toContain('改了 1 個檔案 +1 -1')
+
+  let patch = await patchOf($)
+  expect(patch).toContain('+ONE')
+  expect(patch).not.toContain('+TWO')
+  expect(patch).toContain('# committed, unchanged since: b.txt')
+  patch = await patchOf($, { scope: 'all' })
+  expect(patch).toContain('+TWO')
+  expect(patch).toContain('+ONE')
+  expect(patch).toContain('+bee')
+
+  // The whole conversation reads, but cannot revert: what is committed (and maybe pushed) stays.
+  const ui = await mountPane($)
+  await ui.press({ key: 'scope' })
+  text = textOf(await ui.drawn())
+  expect(text).toContain('整段對話改了 2 個檔案')
+  expect(text).toContain('+TWO')
+  expect(text).toContain('+bee')
+  expect(text).toContain('只能看')
+  expect(await ui.find({ key: 'r0' })).toBeUndefined()
+
+  // Back to what is not committed: a revert goes back to the commit, not before it.
+  await ui.press({ key: 'scope' })
+  await ui.press({ key: 'r0' })
+  expect(textOf(await ui.drawn())).toContain('把 a.txt 還原成上次 commit 的內容？')
+  await ui.press({ key: 'rc0' })
+  expect(w.files.get(spelled(A))).toBe('one\nTWO\n')
+  expect(w.toasts.some(toast => toast.includes('已把 a.txt 還原成上次 commit 的樣子'))).toBe(true)
+  await ui.unmount()
+
+  // Everything committed: the desktop button stays, to reach the whole conversation, and says so.
+  await edit($, A, 'one', 'ONE')
+  git.commit()
+  await $.tool.call({ tool: 'Bash', command: 'git commit -am one' } as never)
+  await clock.advance(1000)
+  const band = await mountBand($, 'desktop')
+  expect(textOf(await band.drawn())).toContain('對話 diff（都 commit 了）')
+  await band.unmount()
+  expect(await drawn($)).toContain('這個對話的改動都 commit 了')
+  expect(w.status).toBeUndefined()
+})
+
+test("changes from before the conversation stay out, and a commit that did not take a file leaves it alone", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const C = 'D:\\proj\\c.txt'
+  const w = world(on, { [A]: 'one\ntwo\n', [C]: 'c\n' })
+  const git = fakeGit(on, w)
+  git.commit()
+  // Not committed when the conversation starts: the person's own work.
+  w.files.set(spelled(A), 'one\ntwo\nmine\n')
+  await $.session.start(START)
+  await clock.advance(1000)
+
+  await edit($, A, 'two', 'TWO')
+  await edit($, C, 'c', 'see')
+  // A commit of c.txt alone (git add c.txt): a.txt is compared with its base as before.
+  git.commit([C])
+  await $.tool.call({ tool: 'Bash', command: 'git commit c.txt -m c' } as never)
+  await clock.advance(1000)
+
+  const text = await drawn($)
+  expect(text).toContain('這個對話改了 1 個檔案')
+  expect(text).toContain('+TWO')
+  expect(text).not.toContain('+mine')
+  expect(text).toContain('已經 commit、之後沒再改（1）：c.txt')
+})
+
+test('a file kept by an older version, its HEAD unknown, counts as committed when HEAD holds other text', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const kept = { key: 'd:/proj/a.txt', path: A, base: 'one\n', isLost: false, seq: 1 }
+  mock.store(on, { [`conv:${NOW}`]: { v: 1, at: NOW, track: { conv: NOW, seq: 1, files: [kept] } } })
+  const w = world(on, { [A]: 'uno\n' })
+  const git = fakeGit(on, w)
+  git.commit()
+  w.files.set(spelled(A), 'uno\ndos\n')
+  await $.session.start(START)
+  await clock.advance(1000)
+
+  const text = await drawn($)
+  expect(text).toContain('+dos')
+  expect(text).not.toContain('-one')
+  expect(await patchOf($, { scope: 'all' })).toContain('-one')
 })
