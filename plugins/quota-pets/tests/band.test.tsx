@@ -295,11 +295,11 @@ test('the context is the belly: it fills toward auto-compaction, a compaction em
 
   // 40k of a 200k window, a quarter of the way to the 160k threshold.
   await eat($, w, 40_000)
-  for (const surface of ['terminal', 'desktop'] as const) {
-    const drawn = await band($, surface)
-    expect(drawn).toContain('肚子 ●○○○○ 20%')
-    expect(lineOf(drawn)).toBe(mood)
-  }
+  const quarter = await band($)
+  expect(quarter).toContain('肚子 ●○○○○ 20%')
+  expect(lineOf(quarter)).toBe(mood)
+  // The desktop draws the context's own gauge beside the model: the pet keeps its lines, not a second gauge.
+  expect(await band($, 'desktop')).not.toContain('肚子 ●')
 
   // Past three quarters of the way: the pet talks about its belly.
   await eat($, w, 130_000)
@@ -531,7 +531,36 @@ test('/petdex 肚子 before any reply and with nothing big eaten yet', async ($,
   expect(said).not.toContain('「')
 })
 
-test('what other plugins draw in the band stays, under the pet', async ($, on) => {
+test('on the desktop the band folds to one line and back, and stays folded in the next session', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on)
+  world(on, limits(66, 46))
+  await $.session.start(START)
+
+  const terminal = await $.ui.mount({ plugin: 'quota-pets', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS as never })
+  expect(await terminal.find({ key: 'fold' })).toBeUndefined()
+  await terminal.unmount()
+
+  const ui = await $.ui.mount({ plugin: 'quota-pets', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS as never })
+  expect(textOf(await ui.drawn())).toContain('飼料(週)')
+  await ui.press({ key: 'fold' })
+  const folded = textOf(await ui.drawn())
+  expect(folded).toContain('5h 66%')
+  expect(folded).not.toContain('飼料(週)')
+  expect(folded).not.toContain('「')
+  expect(await ui.find({ key: 'unfold' })).toBeDefined()
+  await ui.unmount()
+
+  // A new session (a hot reload alike) finds it folded.
+  await $.session.start(START)
+  expect(await band($, 'desktop')).not.toContain('飼料(週)')
+  const again = await $.ui.mount({ plugin: 'quota-pets', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS as never })
+  await again.press({ key: 'unfold' })
+  expect(textOf(await again.drawn())).toContain('飼料(週)')
+  await again.unmount()
+})
+
+test('what other plugins draw in the band stays, beside the pet', async ($, on) => {
   mock.clock(on, { now: NOW })
   mock.store(on)
   const w = world(on, limits(10, 20))

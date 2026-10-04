@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, SessionContextUsage, SessionRateLimit, Timer } from 'claude-code'
+import type { EngineInterface, Register, RenderElement, SessionContextUsage, SessionRateLimit, Timer } from 'claude-code'
 
 import type {
   QuotaPetsActivity,
@@ -90,6 +90,11 @@ const lifeAtom = atom({ plugin: 'quota-pets', key: 'pet' } as const, null)
 const previewAtom = atom({ plugin: 'quota-pets', key: 'preview' } as const, null)
 const bellyAtom = atom({ plugin: 'quota-pets', key: 'belly' } as const, null)
 const activityAtom = atom({ plugin: 'quota-pets', key: 'activity' } as const, null)
+const foldedAtom = atom({ plugin: 'quota-pets', key: 'folded' } as const, false)
+
+// The desktop band's buttons that fold it to one line and back.
+const FOLD = 'fold'
+const UNFOLD = 'unfold'
 
 const PITY = 30
 const KEEP_LIVES = 50
@@ -1236,6 +1241,13 @@ async function tick($: EngineInterface, isBusy: boolean): Promise<void> {
   await update($, activityAtom, value => (value === null ? null : { ...value, nags: value.nags + 1 }))
 }
 
+// Folding sets the band one way or the other, never toggles: a click on the desktop may arrive as a focus move and a
+// press both.
+async function setFolded($: EngineInterface, isFolded: boolean): Promise<void> {
+  await update($, foldedAtom, () => isFolded)
+  await $.store.set('folded', isFolded)
+}
+
 // The meals in this conversation's belly, biggest first: the conversation as the next request sends it, so a
 // compaction's summary stands in for what it replaced. Null when the conversation cannot be read.
 async function mealsNow($: EngineInterface): Promise<Meal[] | null> {
@@ -1452,6 +1464,7 @@ export const register: Register = on => {
       description: '額度寵物圖鑑：抽過的貓狗、陣亡紀錄、保底（試抽／十連／肚子／預覽）',
       argumentHint: '[試抽 | 十連 | 肚子 | 預覽 [0-100 | 深夜 | 散步 | 肚子 0-100 | 吐 | 減肥] [名字]]',
     })
+    if ((await $.store.get('folded')) === true) await update($, foldedAtom, () => true)
     const usage = await $.session.usage()
     await serial(() => ingest($, usage.rateLimits))
     await serial(() => digest($, usage.context))
@@ -1544,7 +1557,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const held = await read($, lifeAtom)
     if (e.props.hasSurvey || held === null) return next(e)
-    // What other plugins draw in the band (convo-diff's button) stays, under the pet.
+    // What other plugins draw in the band (convo-diff's button) stays, beside the pet.
     const beneath = await next(e)
 
     const limits = await read($, limitsAtom)
@@ -1590,12 +1603,37 @@ export const register: Register = on => {
     const isCreepy = stage === 'h1' || stage === 'h2' || stage === 'h3' || stage === 'peek'
     const faceColor = isCreepy ? 'error' : stage === 2 ? 'warning' : undefined
     const food = week === null ? null : foodLine(week, now)
-    const cell = bellyCell(belly, now)
+    // The desktop shows the context's own gauge beside the model: the belly's gauge stays on the terminal.
+    const isDesktop = e.surface === 'desktop'
+    const cell = isDesktop ? null : bellyCell(belly, now)
     const paint = (color: string | undefined) => (color === undefined ? {} : { color })
 
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
+    // What other plugins draw in the band sits to the right of the pet.
+    const beside = (rows: RenderElement) => (
+      <Box flexDirection="row" alignItems="flex-start" columnGap={2}>
+        <Box flexDirection="column" flexGrow={1} flexShrink={1}>
+          {rows}
+        </Box>
+        {beneath}
+      </Box>
+    )
 
-    return (
+    if (isDesktop && (await read($, foldedAtom))) {
+      return beside(
+        <Box flexDirection="row" columnGap={1}>
+          <Text bold dimColor={stage === 'dead'} {...paint(faceColor)}>
+            {face}
+          </Text>
+          {five !== null && !isOver && <Text color={barColor(five.pct)}>{`5h ${pctText(five.pct)}`}</Text>}
+          {five !== null && !isOver && <Text dimColor>{`· ${countdown} 後重置`}</Text>}
+          {isOver && <Text dimColor>5h 已重置</Text>}
+          <Button key={UNFOLD} label="展開" onPress={() => void setFolded($, false)} />
+        </Box>,
+      )
+    }
+
+    return beside(
       <Box flexDirection="column">
         <Box flexDirection="row" columnGap={1}>
           <Text bold dimColor={stage === 'dead'} {...paint(faceColor)}>
@@ -1608,6 +1646,7 @@ export const register: Register = on => {
           <Text dimColor italic={isCreepy} wrap="truncate-end">
             {`「${say}」`}
           </Text>
+          {isDesktop && <Button key={FOLD} label="收起" onPress={() => void setFolded($, true)} />}
         </Box>
         {(five !== null || food !== null || cell !== null) && (
           <Box flexDirection="row" flexWrap="wrap" columnGap={3}>
@@ -1646,8 +1685,20 @@ export const register: Register = on => {
             {shown !== null && <Text color="magenta">（預覽中）</Text>}
           </Box>
         )}
-        {beneath}
-      </Box>
+      </Box>,
     )
+  })
+
+  // While the prompt holds the keys, a click on the desktop band only moves its focus ring onto a button, and the
+  // press waits for a second click. Folding harms nothing and sets one way, so the ring landing on a fold button by
+  // the person's hand folds too.
+  on('ui.focus', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const result = await next(e)
+    const isFold = e.element === FOLD || e.element === UNFOLD
+    if (result.deny === undefined && e.plugin === 'quota-pets' && isFold && e.origin.kind === 'person') {
+      $.clock.after(0, () => void setFolded($, e.element === FOLD))
+    }
+
+    return result
   })
 }

@@ -61,6 +61,8 @@ declare module 'claude-code' {
       preview: QuotaPetsPreview | null
       belly: QuotaPetsBelly | null
       activity: QuotaPetsActivity | null
+      // The band folded to one line, on the desktop; kept in $.store across sessions.
+      folded: boolean
     }
   }
 }
