@@ -2,11 +2,15 @@
 
 我的 Claude Code mods。
 
+- **quota-pets**：額度寵物扭蛋，每個對話抽一隻顏文字貓或狗陪你看額度
+- **convo-diff**：`/convo-diff` 打開面板，只列出這個對話在 repo 裡改過的檔案 diff（每個檔案跟它在這個對話第一次被改之前的內容比），不會混進別的對話或手動的修改
+
 ## 安裝
 
 ```bash
 claude plugin marketplace add https://github.com/Open01277/claude-mods.git
 claude plugin install quota-pets@claude-mods
+claude plugin install convo-diff@claude-mods
 ```
 
 也可以在 Claude Code 裡面輸入：
@@ -14,6 +18,7 @@ claude plugin install quota-pets@claude-mods
 ```
 /plugin marketplace add https://github.com/Open01277/claude-mods.git
 /plugin install quota-pets@claude-mods
+/plugin install convo-diff@claude-mods
 ```
 
 ## 更新

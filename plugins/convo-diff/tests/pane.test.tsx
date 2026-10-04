@@ -1,0 +1,380 @@
+import { expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
+import type { On, RenderElement } from 'claude-code'
+
+const NOW = Date.parse('2026-10-04T10:00:00Z')
+const ROOT = 'D:\\proj'
+const A = 'D:\\proj\\a.txt'
+const B = 'D:\\proj\\b.txt'
+const START = { cwd: ROOT, surface: 'terminal', isInteractive: true } as never
+const SURFACES = ['terminal', 'desktop'] as const
+
+const PANE_PROPS = {
+  title: '對話 diff',
+  isFocused: false,
+  bodyColumns: 100,
+  placement: 'dock',
+  scroll: { offset: 0, bodyRows: 40 },
+  view: {},
+} as const
+
+function spelled(path: string): string {
+  return path.replace(/\\/g, '/').toLowerCase()
+}
+
+// Every string a drawing shows: text children, Button labels and Code sources.
+function textOf(node: unknown): string {
+  if (typeof node === 'string') return node
+  if (node === null || typeof node !== 'object') return ''
+  const element = node as RenderElement & { children?: unknown[]; props?: Record<string, unknown> }
+  const own = [element.props?.label, element.props?.source].filter((value): value is string => typeof value === 'string')
+  return [...own, ...(element.children ?? []).map(textOf)].join(' ')
+}
+
+type World = {
+  startedAt: number
+  files: Map<string, string>
+  messages: unknown[]
+  bash: unknown
+  status: string | undefined
+  opened: string[]
+}
+
+// The engine beneath the plugin: files in memory, and the file tools acting on them.
+function world(on: On, files: Readonly<Record<string, string>>, root = ROOT): World {
+  const w: World = {
+    startedAt: NOW,
+    files: new Map(Object.entries(files).map(([path, text]) => [spelled(path), text])),
+    messages: [],
+    bash: undefined,
+    status: undefined,
+    opened: [],
+  }
+  const get = (path: string) => w.files.get(spelled(path))
+  on('session.start', ($, e) => ({ cwd: (e as { cwd: string }).cwd }) as never)
+  on('session.end', ($, e) => ({ sessionId: (e as { sessionId: string }).sessionId }) as never)
+  on('turn.start', ($, e) => ({ turnId: (e as { turnId: string }).turnId }) as never)
+  on('session.usage',() => ({ value: { startedAt: w.startedAt, context: { window: 200_000 }, rateLimits: [] } }) as never)
+  on('session.root', () => ({ value: root }) as never)
+  on('session.cwd', () => ({ value: root }) as never)
+  on('session.messages', () => ({ value: w.messages }) as never)
+  on('fs.read', ($, e) => {
+    const text = get((e as { path: string }).path)
+    if (text === undefined) throw new Error('ENOENT: no such file or directory')
+    return { value: text } as never
+  })
+  on('fs.exists', ($, e) => ({ value: get((e as { path: string }).path) !== undefined }) as never)
+  on('command.register', ($, e) => ({ value: { command: (e as { name: string }).name } }) as never)
+  on('tool.register', ($, e) => ({ value: { tool: `mcp__convo-diff__${(e as { name: string }).name}` } }) as never)
+  on('ui.status', ($, e) => {
+    w.status = (e as { text: string | undefined }).text
+    return { value: undefined } as never
+  })
+  on('ui.log', () => ({ value: undefined }) as never)
+  on('ui.open', ($, e) => {
+    w.opened.push((e as { id: string }).id)
+    return { value: { isPlaced: true } } as never
+  })
+  on('ui.close', () => ({ value: undefined }) as never)
+  on('tool.call', ($, e) => {
+    const call = e as unknown as Record<string, string> & { tool: string }
+    if (call.tool === 'Edit') {
+      const before = get(call.file_path) ?? ''
+      w.files.set(spelled(call.file_path), before.replace(call.old_string, call.new_string))
+      const result = { filePath: call.file_path, oldString: call.old_string, newString: call.new_string, originalFile: before }
+      return { result: { ...result, structuredPatch: [], userModified: false, replaceAll: false } } as never
+    }
+    if (call.tool === 'Write') {
+      const before = get(call.file_path)
+      w.files.set(spelled(call.file_path), call.content)
+      const type = before === undefined ? 'create' : 'update'
+      return {
+        result: { type, filePath: call.file_path, content: call.content, structuredPatch: [], originalFile: before ?? null },
+      } as never
+    }
+    if (call.tool === 'Bash') {
+      const isReadOnly = call.command.startsWith('ls')
+      const result = { stdout: '', stderr: '', interrupted: false, ...(w.bash === undefined ? {} : { bashEditDiff: w.bash }) }
+      return (isReadOnly ? { result, isReadOnly } : { result }) as never
+    }
+    return { result: {} } as never
+  })
+  return w
+}
+
+async function drawn($: Engine, surface: (typeof SURFACES)[number] = 'terminal'): Promise<string> {
+  const ui = await $.ui.mount({ plugin: 'convo-diff', surface, component: 'Pane', props: PANE_PROPS as never, requestId: 'convo-diff' })
+  const text = textOf(await ui.drawn())
+  await ui.unmount()
+  return text
+}
+
+async function edit($: Engine, path: string, from: string, to: string): Promise<void> {
+  await $.tool.call({ tool: 'Edit', file_path: path, old_string: from, new_string: to } as never)
+}
+
+test("only this conversation's changes show, each against the file before its first change", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, { [A]: 'one\ntwo\nthree\n', [B]: 'x\n' })
+  await $.session.start(START)
+  await clock.advance(1000)
+  expect(await drawn($)).toContain('這個對話還沒有改任何檔案')
+
+  // Another session, or the person, changes b.txt: not this conversation's.
+  w.files.set(spelled(B), 'x changed elsewhere\n')
+  await edit($, A, 'two', 'TWO')
+  await edit($, A, 'three', 'three\nfour')
+  await clock.advance(1000)
+
+  for (const surface of SURFACES) {
+    const text = await drawn($, surface)
+    expect(text).toContain('a.txt')
+    expect(text).not.toContain('b.txt')
+    expect(text).toContain('-two')
+    expect(text).toContain('+TWO')
+    expect(text).toContain('+four')
+    expect(text).toContain('這個對話改了 1 個檔案')
+  }
+  expect(w.status).toContain('改了 1 個檔案 +2 -1')
+})
+
+test('a file written back to how it was shows no difference, a new one shows whole', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  world(on, { [A]: 'keep\n' })
+  await $.session.start(START)
+  await clock.advance(1000)
+
+  await $.tool.call({ tool: 'Write', file_path: A, content: 'changed\n' } as never)
+  await $.tool.call({ tool: 'Write', file_path: A, content: 'keep\n' } as never)
+  await $.tool.call({ tool: 'Write', file_path: 'D:\\proj\\new.md', content: '# hi\nthere\n' } as never)
+  await clock.advance(1000)
+
+  const text = await drawn($)
+  expect(text).toContain('無差異')
+  expect(text).toContain('改了又改回來')
+  expect(text).toContain('new.md')
+  expect(text).toContain('新增')
+  expect(text).toContain('+# hi')
+  expect(text).toContain('這個對話改了 1 個檔案')
+})
+
+test('Bash edits the engine tracked are followed: created, deleted and changed files', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, { [A]: 'a\nb\nc\n', 'D:\\proj\\gone.txt': 'g1\ng2\n' })
+  await $.session.start(START)
+  await clock.advance(1000)
+
+  // A read-only command never counts.
+  w.bash = { files: [{ filePath: A, hunks: [] }], moreFiles: 0 }
+  await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+
+  w.files.set(spelled(A), 'a\nB\nc\n')
+  w.files.delete(spelled('D:\\proj\\gone.txt'))
+  w.files.set(spelled('D:\\proj\\made.txt'), 'm\n')
+  w.bash = {
+    files: [
+      { filePath: 'a.txt', hunks: [{ oldStart: 1, oldLines: 3, newStart: 1, newLines: 3, lines: [' a', '-b', '+B', ' c'] }] },
+      { filePath: 'D:\\proj\\gone.txt', deleted: true, hunks: [{ oldStart: 1, oldLines: 2, newStart: 0, newLines: 0, lines: ['-g1', '-g2'] }] },
+      { filePath: 'D:\\proj\\made.txt', created: true, hunks: [{ oldStart: 0, oldLines: 0, newStart: 1, newLines: 1, lines: ['+m'] }] },
+    ],
+    moreFiles: 0,
+  }
+  await $.tool.call({ tool: 'Bash', command: 'sed -i s/b/B/ a.txt && rm gone.txt && echo m > made.txt' } as never)
+  await clock.advance(1000)
+
+  const text = await drawn($)
+  expect(text).toContain('這個對話改了 3 個檔案')
+  expect(text).toContain('-b')
+  expect(text).toContain('+B')
+  expect(text).toContain('gone.txt')
+  expect(text).toContain('刪除')
+  expect(text).toContain('-g1')
+  expect(text).toContain('made.txt')
+  expect(text).toContain('+m')
+})
+
+test('a /clear starts over, and going back to the first conversation finds its files in the store', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, { [A]: 'one\n' })
+  await $.session.start(START)
+  await clock.advance(1000)
+  await edit($, A, 'one', 'uno')
+  await clock.advance(1000)
+  expect(await drawn($)).toContain('+uno')
+
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } } as never)
+  w.startedAt = NOW + 60_000
+  await $.turn.start({ text: 'hi', turnId: 't1' } as never)
+  await clock.advance(1000)
+  expect(await drawn($)).toContain('這個對話還沒有改任何檔案')
+  expect(w.status).toBeUndefined()
+
+  w.startedAt = NOW
+  await $.turn.start({ text: 'back again', turnId: 't2' } as never)
+  await $.command.run({ command: 'convo-diff', args: '' } as never)
+  const text = await drawn($)
+  expect(text).toContain('-one')
+  expect(text).toContain('+uno')
+})
+
+test('a conversation from before the mod was on is read from its transcript', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, { [A]: 'new text\n' })
+  w.messages = [
+    { role: 'user', text: 'change a', toolUses: [] },
+    {
+      role: 'assistant',
+      text: '',
+      toolUses: [
+        {
+          tool_use_id: 'u1',
+          tool: 'Edit',
+          input: { file_path: A, old_string: 'old', new_string: 'new' },
+          result: { filePath: A, oldString: 'old', newString: 'new', originalFile: 'old text\n', structuredPatch: [] },
+        },
+        { tool_use_id: 'u2', tool: 'Read', input: { file_path: B }, result: { type: 'text' } },
+      ],
+    },
+  ]
+  await $.session.start(START)
+  await clock.advance(1000)
+
+  const text = await drawn($)
+  expect(text).toContain('-old text')
+  expect(text).toContain('+new text')
+})
+
+test("Bash changes in the transcript are undone from what came after them", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const C = 'D:\\proj\\c.txt'
+  const D = 'D:\\proj\\d.txt'
+  const w = world(on, { [C]: 'a\nB\nc\n', [D]: 'z\n', 'D:\\proj\\made.txt': 'm\n' })
+  const bash = (files: unknown[]) => ({ stdout: '', stderr: '', interrupted: false, bashEditDiff: { files, moreFiles: 0 } })
+  w.messages = [
+    {
+      role: 'assistant',
+      text: '',
+      toolUses: [
+        {
+          tool_use_id: 'b1',
+          tool: 'Bash',
+          input: { command: 'sed and friends' },
+          result: bash([
+            { filePath: 'made.txt', created: true, hunks: [{ oldStart: 0, oldLines: 0, newStart: 1, newLines: 1, lines: ['+m'] }] },
+            { filePath: C, hunks: [{ oldStart: 1, oldLines: 3, newStart: 1, newLines: 3, lines: [' a', '-b', '+B', ' c'] }] },
+            { filePath: D, hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-x', '+y'] }] },
+          ]),
+        },
+        // d.txt changed again afterwards: that Edit's record holds what the command left.
+        {
+          tool_use_id: 'e1',
+          tool: 'Edit',
+          input: { file_path: D, old_string: 'y', new_string: 'z' },
+          result: { filePath: D, oldString: 'y', newString: 'z', originalFile: 'y\n', structuredPatch: [] },
+        },
+      ],
+    },
+  ]
+  await $.session.start(START)
+  await clock.advance(1000)
+
+  const text = await drawn($)
+  expect(text).toContain('這個對話改了 3 個檔案')
+  expect(text).toContain('made.txt')
+  expect(text).toContain('+m')
+  expect(text).toContain('-b')
+  expect(text).toContain('+B')
+  expect(text).toContain('-x')
+  expect(text).toContain('+z')
+  expect(text).not.toContain('無法比對')
+})
+
+test('files fold and unfold, and the choice holds on every surface', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  world(on, { [A]: 'one\n', [B]: 'b\n' })
+  await $.session.start(START)
+  await clock.advance(1000)
+  await edit($, A, 'one', 'uno')
+  await edit($, B, 'b', 'bee')
+  await clock.advance(1000)
+
+  const ui = await $.ui.mount({ plugin: 'convo-diff', surface: 'terminal', component: 'Pane', props: PANE_PROPS as never, requestId: 'convo-diff' })
+  expect(await ui.findAll({ type: 'Code' })).toHaveLength(2)
+  await ui.press({ key: 'f0' })
+  expect(await ui.findAll({ type: 'Code' })).toHaveLength(1)
+  await ui.press({ key: 'fold' })
+  expect(await ui.findAll({ type: 'Code' })).toHaveLength(0)
+  await ui.press({ key: 'fold' })
+  expect(await ui.findAll({ type: 'Code' })).toHaveLength(2)
+  await ui.press({ key: 'f1' })
+  await ui.unmount()
+
+  // The choices are the session's, so another surface draws them the same.
+  const text = await drawn($, 'desktop')
+  expect(text).toContain('+uno')
+  expect(text).not.toContain('+bee')
+})
+
+test('files outside the repo never count, and git finds the repo above where the session started', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const scratch = 'C:\\Temp\\scratch.txt'
+  const w = world(on, { [A]: 'one\n', [scratch]: 's\n' }, 'D:\\proj\\sub')
+  const top = { exitCode: 0, stdout: 'D:/proj\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
+  on('process.run', () => ({ value: top }) as never)
+  await $.session.start(START)
+  await clock.advance(1000)
+
+  await edit($, A, 'one', 'uno')
+  await edit($, scratch, 's', 'scratch')
+  await $.tool.call({ tool: 'Write', file_path: 'C:\\Users\\me\\.claude\\memory\\note.md', content: 'remember\n' } as never)
+  await clock.advance(1000)
+
+  for (const surface of SURFACES) {
+    const text = await drawn($, surface)
+    expect(text).toContain('a.txt')
+    expect(text).toContain('+uno')
+    expect(text).not.toContain('scratch')
+    expect(text).not.toContain('note.md')
+    expect(text).toContain('這個對話改了 1 個檔案')
+  }
+  expect(w.status).toContain('改了 1 個檔案')
+  const patch = String(((await $.tool.call({ tool: 'mcp__convo-diff__diff' } as never)) as { result?: unknown }).result)
+  expect(patch).toContain('--- a/a.txt')
+  expect(patch).not.toContain('scratch')
+})
+
+test('the command opens the pane and the model can read the same diff', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, { [A]: 'one\ntwo\n', [B]: 'b\n' })
+  await $.session.start(START)
+  await clock.advance(1000)
+  await edit($, A, 'two', 'TWO')
+  await edit($, B, 'b', 'bee')
+
+  const said = await $.command.run({ command: 'convo-diff', args: '' } as never)
+  expect(said.text).toContain('這個對話改了 2 個檔案（+2 -2）')
+  expect(w.opened).toContain('convo-diff')
+
+  const all = await $.tool.call({ tool: 'mcp__convo-diff__diff' } as never)
+  const patch = String((all as { result?: unknown }).result)
+  expect(patch).toContain('--- a/a.txt')
+  expect(patch).toContain('+++ b/a.txt')
+  expect(patch).toContain('-two')
+  expect(patch).toContain('+TWO')
+  expect(patch).toContain('--- a/b.txt')
+
+  const one = await $.tool.call({ tool: 'mcp__convo-diff__diff', path: 'b.txt' } as never)
+  const only = String((one as { result?: unknown }).result)
+  expect(only).toContain('+bee')
+  expect(only).not.toContain('a.txt')
+  console.log(patch)
+})
