@@ -536,7 +536,7 @@ const RARITY_COLOR: Record<Rarity, string> = {
   N: 'gray',
   R: 'blue',
   SR: 'magenta',
-  SSR: 'yellow',
+  SSR: 'warning',
   UR: 'red',
 }
 
@@ -632,23 +632,23 @@ function bar(pct: number): string {
 }
 
 function barColor(pct: number): string {
-  return pct >= 85 ? 'red' : pct >= 60 ? 'yellow' : 'green'
+  return pct >= 85 ? 'error' : pct >= 60 ? 'warning' : 'success'
 }
 
 function foodLine(week: QuotaPetsLimit, now: number): { text: string; color: string } {
   const left = week.resetsAt === null ? null : Math.max(0, week.resetsAt - now)
   const restock = left === null ? '' : `（${dur(left)}後補貨）`
-  if (left === 0) return { text: '補貨了！等下一筆資料', color: 'green' }
-  if (week.pct >= 100) return { text: `吃光了…這週剩下的日子…牠們要吃什麼…${restock}`, color: 'red' }
-  if (week.pct >= 90) return { text: `只剩袋底了…袋子裡…好像有東西在動…${restock}`, color: 'red' }
-  if (left === null) return { text: '還夠吃', color: 'green' }
+  if (left === 0) return { text: '補貨了！等下一筆資料', color: 'success' }
+  if (week.pct >= 100) return { text: `吃光了…這週剩下的日子…牠們要吃什麼…${restock}`, color: 'error' }
+  if (week.pct >= 90) return { text: `只剩袋底了…袋子裡…好像有東西在動…${restock}`, color: 'error' }
+  if (left === null) return { text: '還夠吃', color: 'success' }
   const elapsed = WEEK_MS - left
-  if (week.pct <= 0 || elapsed < 3 * 3600_000) return { text: `滿滿一整袋${restock}`, color: 'green' }
+  if (week.pct <= 0 || elapsed < 3 * 3600_000) return { text: `滿滿一整袋${restock}`, color: 'success' }
   const toEmpty = ((100 - week.pct) * elapsed) / week.pct
-  if (toEmpty >= left) return { text: `夠吃到補貨${restock}`, color: 'green' }
+  if (toEmpty >= left) return { text: `夠吃到補貨${restock}`, color: 'success' }
   return {
     text: `照這速度 ${dur(toEmpty)} 後吃光，比補貨早 ${dur(left - toEmpty)}`,
-    color: 'yellow',
+    color: 'warning',
   }
 }
 
@@ -1048,7 +1048,7 @@ export const register: Register = on => {
       say = sayOf(pet, stage, seed, countdown)
     }
     const isCreepy = stage === 'h1' || stage === 'h2' || stage === 'h3' || stage === 'peek'
-    const faceColor = isCreepy ? 'red' : stage === 2 ? 'yellow' : undefined
+    const faceColor = isCreepy ? 'error' : stage === 2 ? 'warning' : undefined
     const food = week === null ? null : foodLine(week, now)
     const paint = (color: string | undefined) => (color === undefined ? {} : { color })
 
