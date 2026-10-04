@@ -773,7 +773,7 @@ export const register: Register = on => {
     })
     const view = await read($, viewAtom)
     const { changed, added, removed } = totals(view?.files ?? [])
-    const opened = await $.ui.open({ id: PANE, title: TITLE, rows: 30 })
+    const opened = await $.ui.open({ id: PANE, title: TITLE, rows: 30, focus: true })
     const head = changed === 0 ? '這個對話還沒有改任何檔案' : `這個對話改了 ${changed} 個檔案（+${added} -${removed}）`
 
     return { text: opened.isPlaced ? `${head}，diff 在面板裡。` : `${head}；面板還沒顯示：${opened.reason}` }

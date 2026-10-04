@@ -16,7 +16,7 @@
       "name": "convo-diff",
       "source": "./plugins/convo-diff",
       "description": "只看這個對話改過的檔案 diff：每個檔案跟它在這個對話第一次被改之前的內容比，不混進別的對話或手動的修改；每個檔案可以一鍵請 Claude 在對話裡解釋改動，或還原成改之前的樣子",
-      "version": "0.2.0"
+      "version": "0.2.1"
     }
   ]
 }
