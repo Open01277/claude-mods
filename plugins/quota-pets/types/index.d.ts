@@ -3,6 +3,9 @@ export type QuotaPetsLimit = { pct: number; resetsAt: number | null }
 export type QuotaPetsLimits = {
   five: QuotaPetsLimit | null
   week: QuotaPetsLimit | null
+  // When the reading came, in this session or another: every session leaves its latest in $.store and takes up a
+  // newer one from there, so a conversation shows what another one just read.
+  at?: number
 }
 
 // One conversation's pet: pulled when the conversation starts, re-pulled on each 5-hour reset.

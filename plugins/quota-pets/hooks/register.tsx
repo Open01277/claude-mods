@@ -7,6 +7,7 @@ import type {
   QuotaPetsCompaction,
   QuotaPetsLife,
   QuotaPetsLimit,
+  QuotaPetsLimits,
   QuotaPetsPreview,
   QuotaPetsScene,
 } from '../types'
@@ -100,6 +101,10 @@ const PITY = 30
 const KEEP_LIVES = 50
 const MINUTE = 60_000
 const HALF_HOUR = 30 * MINUTE
+// How often a session looks for another one's newer quota reading, and how old a reading is before a turn will not
+// count its spending from it.
+const SYNC_MS = 15_000
+const STALE_AFTER = 3 * MINUTE
 const DAY_MS = 24 * 3600_000
 const WEEK_MS = 7 * DAY_MS
 // Ten quiet minutes is a break; fifty minutes without one and the pet wants a walk, then asks every half hour.
@@ -771,7 +776,7 @@ function lane(week: QuotaPetsLimit, now: number, isScary: boolean): { glyph: str
   const eaten = Math.min(7, (week.pct * 7) / 100)
   const done = Math.min(7, Math.floor(eaten + 1e-9))
   const today = week.resetsAt === null ? 6 : dayOf(Math.max(0, week.resetsAt - now))
-  const dots = Array.from({ length: done }, (_, day) => (day > today ? { glyph: '·', color: 'warning' } : { glyph: '·' }))
+  const dots = Array.from({ length: done }, (_, day) => (day > today ? { glyph: '•', color: 'warning' } : { glyph: '•' }))
   const ghosts = Array.from({ length: 7 - done }, (_, index) => {
     const day = done + index
     if (isScary) return { glyph: 'ᗣ', color: 'error' }
@@ -1117,13 +1122,39 @@ async function lifeOf(
   return life
 }
 
+// The quota is the account's, and a session only reads it from its own answers: every session leaves its latest
+// reading in $.store, a file all of them share, and takes up one newer than its own from there. So a conversation
+// opened, or come back to, shows what another one just read. A window already past its reset is left out.
+async function recall($: EngineInterface): Promise<void> {
+  const kept = (await $.store.get('limits')) as { five?: QuotaPetsLimit | null; week?: QuotaPetsLimit | null; at?: number } | undefined
+  if (kept === undefined || kept === null || typeof kept.at !== 'number') return
+  const held = await read($, limitsAtom)
+  if (held !== null && (held.at ?? 0) >= kept.at) return
+  const now = await $.clock.now()
+  const live = (limit: QuotaPetsLimit | null | undefined) =>
+    limit === undefined || limit === null || limit.resetsAt === null || limit.resetsAt <= now ? null : limit
+  const five = live(kept.five)
+  const week = live(kept.week)
+  const at = kept.at
+  if (five !== null || week !== null) await update($, limitsAtom, () => ({ five, week, at }))
+}
+
+// A reading this old is no start to count a turn's spending from.
+function ageOf(limits: QuotaPetsLimits | null, now: number): number | null {
+  const at = limits?.at
+  return at === undefined || now - at < STALE_AFTER ? null : now - at
+}
+
 async function ingest($: EngineInterface, rateLimits: readonly SessionRateLimit[]): Promise<void> {
   const five = toLimit(rateLimits.find(limit => limit.kind === 'five_hour'))
   const week = toLimit(rateLimits.find(limit => limit.kind === 'seven_day'))
-  if (five !== null || week !== null) await update($, limitsAtom, () => ({ five, week }))
+  const now = await $.clock.now()
+  if (five !== null || week !== null) {
+    await update($, limitsAtom, () => ({ five, week, at: now }))
+    await $.store.set('limits', { five, week, at: now })
+  }
 
   const { startedAt: conv } = await $.session.usage()
-  const now = await $.clock.now()
   const save = await load($)
   const before = JSON.stringify(save)
   let life = await lifeOf($, save, conv, five, now)
@@ -1467,8 +1498,13 @@ export const register: Register = on => {
     if ((await $.store.get('folded')) === true) await update($, foldedAtom, () => true)
     const usage = await $.session.usage()
     await serial(() => ingest($, usage.rateLimits))
+    await serial(() => recall($))
     await serial(() => digest($, usage.context))
     learnLater($)
+    // Another conversation's newer reading, taken up soon after it comes.
+    $.clock.every(SYNC_MS, () => {
+      void serial(() => recall($)).catch(error => $.ui.log(`recall failed: ${String(error)}`, { to: 'debug' }))
+    })
     // The countdowns move even when the percent does not, and a run of work grows by the minute.
     $.clock.every(MINUTE, () => {
       void serial(() => tick($, running.size > 0)).catch(error => $.ui.log(`tick failed: ${String(error)}`, { to: 'debug' }))
@@ -1476,6 +1512,14 @@ export const register: Register = on => {
     })
 
     return next(e)
+  })
+
+  // The desktop opening this conversation again: what other conversations read meanwhile shows at once.
+  on('session.attach', async ($, e, next) => {
+    const result = await next(e)
+    await serial(() => recall($)).catch(() => undefined)
+
+    return result
   })
 
   on('session.measure', async ($, e, next) => {
@@ -1510,8 +1554,10 @@ export const register: Register = on => {
     if (life === null || life.conv !== usage.startedAt) {
       await serial(() => ingest($, usage.rateLimits))
     }
+    // An old reading is no start to count this turn's spending from.
+    await serial(() => recall($))
     const limits = await read($, limitsAtom)
-    const five = limits?.five ?? null
+    const five = ageOf(limits, await $.clock.now()) !== null ? null : (limits?.five ?? null)
     turnStart = five === null ? null : { turnId: e.turnId, pct: five.pct, window: five.resetsAt }
     const now = await $.clock.now()
     await serial(() => stir($, now))

@@ -30,7 +30,7 @@ function laneOf(node: unknown): string[] {
   if (node === null || typeof node !== 'object') return []
   const { props, children = [] } = node as { props?: Record<string, unknown>; children?: unknown[] }
   const [only] = children
-  if (children.length === 1 && typeof only === 'string' && /^[·ᗧᗣ]$/.test(only)) {
+  if (children.length === 1 && typeof only === 'string' && /^[•ᗧᗣ]$/.test(only)) {
     return [`${only}${props?.dimColor === true ? 'dim' : String(props?.color)}`]
   }
   return children.flatMap(laneOf)
@@ -226,26 +226,26 @@ test('the week is seven ghosts that Pac-Man eats, one per day', async ($, on) =>
 
   // Blue: a day that has come. Dim: one still ahead. Yellow: one eaten before it came. Red: the last of the food.
   const weeks = [
-    { pct: 60, resetsIn: 5 * DAY, food: '····ᗧᗣᗣᗣ60%·偷吃到後天的份了', lane: '·dim ·dim ·dim ·warning ᗧwarning ᗣwarning ᗣdim ᗣdim' },
-    { pct: 21, resetsIn: 95 * HOUR, food: '·ᗧᗣᗣᗣᗣᗣᗣ21%·存了2天份', lane: '·dim ᗧwarning ᗣblue ᗣblue ᗣblue ᗣdim ᗣdim ᗣdim' },
-    { pct: 40, resetsIn: 98 * HOUR, food: '··ᗧᗣᗣᗣᗣᗣ40%·照進度在吃', lane: '·dim ·dim ᗧwarning ᗣblue ᗣdim ᗣdim ᗣdim ᗣdim' },
+    { pct: 60, resetsIn: 5 * DAY, food: '••••ᗧᗣᗣᗣ60%·偷吃到後天的份了', lane: '•dim •dim •dim •warning ᗧwarning ᗣwarning ᗣdim ᗣdim' },
+    { pct: 21, resetsIn: 95 * HOUR, food: '•ᗧᗣᗣᗣᗣᗣᗣ21%·存了2天份', lane: '•dim ᗧwarning ᗣblue ᗣblue ᗣblue ᗣdim ᗣdim ᗣdim' },
+    { pct: 40, resetsIn: 98 * HOUR, food: '••ᗧᗣᗣᗣᗣᗣ40%·照進度在吃', lane: '•dim •dim ᗧwarning ᗣblue ᗣdim ᗣdim ᗣdim ᗣdim' },
     {
       pct: 60,
       resetsIn: 20 * HOUR,
-      food: '····ᗧᗣᗣᗣ60%·最後一天還剩3天份，吃大餐！（20h00m後補貨）',
-      lane: '·dim ·dim ·dim ·dim ᗧwarning ᗣblue ᗣblue ᗣblue',
+      food: '••••ᗧᗣᗣᗣ60%·最後一天還剩3天份，吃大餐！（20h00m後補貨）',
+      lane: '•dim •dim •dim •dim ᗧwarning ᗣblue ᗣblue ᗣblue',
     },
     {
       pct: 93,
       resetsIn: 2 * DAY,
-      food: '······ᗧᗣ93%·只剩袋底了…袋子裡…好像有東西在動…（2天後補貨）',
-      lane: '·dim ·dim ·dim ·dim ·dim ·dim ᗧwarning ᗣerror',
+      food: '••••••ᗧᗣ93%·只剩袋底了…袋子裡…好像有東西在動…（2天後補貨）',
+      lane: '•dim •dim •dim •dim •dim •dim ᗧwarning ᗣerror',
     },
     {
       pct: 100,
       resetsIn: 18 * HOUR,
-      food: '·······ᗧ100%·吃光了…這週剩下的日子…牠們要吃什麼…（18h00m後補貨）',
-      lane: '·dim ·dim ·dim ·dim ·dim ·dim ·dim ᗧwarning',
+      food: '•••••••ᗧ100%·吃光了…這週剩下的日子…牠們要吃什麼…（18h00m後補貨）',
+      lane: '•dim •dim •dim •dim •dim •dim •dim ᗧwarning',
     },
   ]
   for (const { pct, resetsIn, food, lane } of weeks) {
@@ -572,4 +572,61 @@ test('what other plugins draw in the band stays, beside the pet', async ($, on) 
     expect(drawn).toContain('這個對話改了 2 個檔案')
     expect(drawn.indexOf('5h')).toBeLessThan(drawn.indexOf('對話 diff'))
   }
+})
+
+// $.store as the engine keeps it: one file every session reads afresh, so another session's write shows at once.
+function sharedStore(on: On, entries: Record<string, unknown>): Map<string, unknown> {
+  const store = new Map(Object.entries(entries))
+  on('store.get', ($, e) => ({ value: store.get((e as { key: string }).key) }) as never)
+  on('store.set', ($, e) => {
+    const { key, value } = e as { key: string; value: unknown }
+    store.set(key, JSON.parse(JSON.stringify(value)))
+    return { value: undefined } as never
+  })
+  on('store.delete', ($, e) => {
+    store.delete((e as { key: string }).key)
+    return { value: undefined } as never
+  })
+  on('store.keys', () => ({ value: [...store.keys()] }) as never)
+  return store
+}
+
+test('a conversation shows the quota other conversations read, opened new or come back to', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  // An earlier session read this half an hour ago; the week it saw has restocked since.
+  const store = sharedStore(on, {
+    limits: { five: { pct: 58, resetsAt: NOW + 2 * HOUR }, week: { pct: 90, resetsAt: NOW - HOUR }, at: NOW - 30 * MINUTE },
+  })
+  const w = world(on, [])
+  await $.session.start(START)
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const drawn = await band($, surface)
+    expect(drawn).toContain('58%')
+    expect(drawn).not.toContain('飼料(週)')
+    expect(drawn).not.toContain('還沒拿到額度資料')
+  }
+
+  // Another conversation gets an answer: this one takes its reading up within seconds, nobody saying a word here.
+  store.set('limits', { five: { pct: 71, resetsAt: NOW + 2 * HOUR }, week: { pct: 33, resetsAt: NOW + 3 * DAY }, at: NOW + 5000 })
+  await clock.advance(15_000)
+  let drawn = await band($)
+  expect(drawn).toContain('71%')
+  expect(drawn).toContain('33%')
+
+  // This conversation's own answer is newer still: it shows, and the others will take it up.
+  await $.turn.start({ text: 'go', turnId: 't1' } as never)
+  await clock.advance(5000)
+  w.rateLimits = limits(74, 34)
+  await measure($, w.rateLimits)
+  await $.turn.complete({ turnId: 't1', answer: '', durationMs: 5000, isAborted: false, reason: 'end_turn' } as never)
+  drawn = await band($)
+  expect(drawn).toContain('74%')
+  expect((store.get('limits') as { five: { pct: number } }).five.pct).toBe(74)
+  // An older reading in the store never takes the place of a newer one.
+  store.set('limits', { five: { pct: 10, resetsAt: NOW + 2 * HOUR }, week: null, at: NOW })
+  await clock.advance(15_000)
+  expect(await band($)).toContain('74%')
+  // The turn counted from 71%, a reading seconds old: +3 is no big bite, so no toast.
+  expect(w.shown.filter(text => !text.startsWith('log:'))).toEqual([])
 })
