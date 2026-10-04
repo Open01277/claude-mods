@@ -2,7 +2,9 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, RenderElement, SessionRateLimit } from 'claude-code'
 
-const NOW = Date.parse('2026-10-03T10:00:00Z')
+// Local time, so the pet keeps the same hours wherever the tests run: 18:00, nowhere near bedtime.
+const NOW = new Date(2026, 9, 3, 18, 0).getTime()
+const MINUTE = 60_000
 const HOUR = 3600_000
 const DAY = 24 * HOUR
 const CATS = ['普通貓', '橘貓', '賓士貓', '鍵盤貓', '實習生貓', '墨鏡貓', '工程師貓', '黑貓', 'PM貓', '招財貓', '太空貓', '薛丁格的貓', '液態貓', '貓神']
@@ -41,21 +43,33 @@ const BAND_PROPS = {
   bodyColumns: 100,
 } as const
 
+type Context = { window: number; tokens?: number; percent?: number }
+
+const SUMMARY = { role: 'user', text: 'Summary of the conversation so far.', toolUses: [] }
+
 // The engine beneath the plugin: usage the test moves, and every toast and log line it was asked to show.
 function world(on: On, rateLimits: SessionRateLimit[]) {
-  const state = { rateLimits, startedAt: NOW, shown: [] as string[] }
+  const state = {
+    rateLimits,
+    startedAt: NOW,
+    context: { window: 200_000 } as Context,
+    // Where auto-compaction runs, as the breakdown reports it; undefined while it is off.
+    threshold: 160_000 as number | undefined,
+    shown: [] as string[],
+  }
   on('session.start', ($, e) => ({ cwd: (e as { cwd: string }).cwd }) as never)
   on('session.measure', ($, e) => ({ changed: (e as { changed: string[] }).changed }) as never)
+  on('session.compact', () => ({ messages: [SUMMARY], tokensBefore: 165_000, tokensAfter: 21_000 }) as never)
   on('turn.start', ($, e) => ({ turnId: (e as { turnId: string }).turnId }) as never)
+  on('turn.complete', () => ({ text: '' }) as never)
   on('command.register', ($, e) => ({ value: { command: (e as { name: string }).name } }) as never)
   on('ui.invalidate', () => ({ value: undefined }) as never)
-  on(
-    'session.usage',
-    () =>
-      ({
-        value: { startedAt: state.startedAt, context: { window: 200_000 }, rateLimits: state.rateLimits },
-      }) as never,
-  )
+  on('session.usage', ($, e) => {
+    const isBroken = (e as { breakdown?: string }).breakdown !== undefined
+    const breakdown = { isAutoCompactEnabled: state.threshold !== undefined, autoCompactThreshold: state.threshold }
+    const context = isBroken ? { ...state.context, breakdown } : state.context
+    return { value: { startedAt: state.startedAt, context, rateLimits: state.rateLimits } } as never
+  })
   on('ui.toast', ($, e) => {
     state.shown.push((e as { text: string }).text)
     return { value: undefined } as never
@@ -78,6 +92,24 @@ async function band($: Engine, surface: 'terminal' | 'desktop' = 'terminal'): Pr
 
 async function measure($: Engine, rateLimits: SessionRateLimit[]): Promise<void> {
   await $.session.measure({ context: { window: 200_000 }, rateLimits, changed: ['rateLimits'] } as never)
+}
+
+// A response reports the context: the belly fills.
+async function eat($: Engine, w: ReturnType<typeof world>, tokens: number): Promise<void> {
+  w.context = { window: 200_000, tokens, percent: Math.round((tokens / 200_000) * 100) }
+  await $.session.measure({ context: w.context, rateLimits: w.rateLimits, changed: ['context'] } as never)
+}
+
+// The person's prompt and the turn it starts, running for `minutes`.
+async function turn($: Engine, clock: { advance: (ms: number) => Promise<void> }, id: string, minutes: number): Promise<void> {
+  await $.turn.start({ text: 'go', turnId: id } as never)
+  await clock.advance(minutes * MINUTE)
+  await $.turn.complete({ turnId: id, answer: '', durationMs: minutes * MINUTE, isAborted: false, reason: 'end_turn' } as never)
+}
+
+// The pet's line, between 「 and 」.
+function lineOf(drawn: string): string {
+  return /「(.*)」/.exec(drawn)?.[1] ?? ''
 }
 
 test('a conversation pulls a pet that follows the quota to its death and is reborn at the reset', { timeoutMs: 20_000 }, async ($, on) => {
@@ -231,4 +263,187 @@ test('every pet draws at every stage of the quota', { timeoutMs: 60_000 }, async
   }
   const missing = await $.command.run({ command: 'petdex', args: '預覽 50 貴賓狗' } as never)
   expect(missing.text).toContain('沒有這隻')
+})
+
+test('the context is the belly: it fills toward auto-compaction, a compaction empties it', { timeoutMs: 20_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, limits(10, 20))
+  await $.session.start(START)
+  // The threshold is read off the hook's path.
+  await clock.advance(1000)
+  const mood = lineOf(await band($))
+  // No response has reported the context yet: no belly.
+  expect(await band($)).not.toContain('肚子')
+
+  // 40k of a 200k window, a quarter of the way to the 160k threshold.
+  await eat($, w, 40_000)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const drawn = await band($, surface)
+    expect(drawn).toContain('肚子 ●○○○○ 20%')
+    expect(lineOf(drawn)).toBe(mood)
+  }
+
+  // Past three quarters of the way: the pet talks about its belly.
+  await eat($, w, 130_000)
+  const full = await band($)
+  expect(full).toContain('肚子 ●●●●○ 65%')
+  expect(lineOf(full)).not.toBe(mood)
+  expect(lineOf(full)).toMatch(/token|compact|肚子/)
+  expect(w.shown.some(text => text.includes('肚子快撐爆了'))).toBe(false)
+
+  // About to burst: one toast, however many readings follow.
+  await eat($, w, 150_000)
+  await eat($, w, 152_000)
+  const bursting = await band($)
+  expect(bursting).toContain('肚子 ●●●●● 76%')
+  expect(lineOf(bursting)).not.toBe(lineOf(full))
+  expect(w.shown.filter(text => text.includes('肚子快撐爆了')).length).toBe(1)
+  expect(w.shown.some(text => text.includes('快要自動壓縮了'))).toBe(true)
+
+  // The engine compacts at its threshold: the pet throws up.
+  await $.session.compact({ trigger: 'auto', messages: [SUMMARY] } as never)
+  expect(w.shown.some(text => text.includes('撐到吐了') && text.includes('165k') && text.includes('21k'))).toBe(true)
+  const burped = await band($)
+  expect(burped).toContain('肚子 ○○○○○ 剛吐完')
+  expect(lineOf(burped)).toMatch(/吐|忘/)
+
+  // The next response reports the emptier context.
+  await eat($, w, 30_000)
+  expect(await band($)).toContain('肚子 ●○○○○ 15%')
+
+  // A /compact is a diet.
+  await $.session.compact({ trigger: 'manual', messages: [SUMMARY] } as never)
+  expect(w.shown.some(text => text.includes('減肥成功') && text.includes('瘦到 21k'))).toBe(true)
+  const slimmed = await band($)
+  expect(slimmed).toContain('剛減肥完')
+  expect(lineOf(slimmed)).toMatch(/減肥|瘦/)
+
+  // Ten minutes on, it is the pet's own line again.
+  await clock.advance(11 * MINUTE)
+  expect(lineOf(await band($))).toBe(mood)
+  const dex = await $.command.run({ command: 'petdex', args: '' } as never)
+  console.log(w.shown.join('\n'))
+  console.log(dex.text.split('\n')[1])
+})
+
+test('with auto-compaction off, the whole window is the belly', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, limits(10, 20))
+  w.threshold = undefined
+  await $.session.start(START)
+  await clock.advance(1000)
+
+  await eat($, w, 150_000)
+  expect(await band($)).toContain('肚子 ●●●●○ 75%')
+  expect(w.shown.some(text => text.includes('肚子快撐爆了'))).toBe(false)
+  await eat($, w, 185_000)
+  expect(w.shown.some(text => text.includes('肚子快撐爆了') && text.includes('/compact'))).toBe(true)
+})
+
+test('fifty minutes of work without a break and the pet asks for a walk; a break brings it back cheerful', { timeoutMs: 20_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, limits(10, 20))
+  await $.session.start(START)
+  const mood = lineOf(await band($))
+  const nags = () => w.shown.filter(text => /分鐘|小時/.test(text)).length
+
+  // Turns with short pauses between them are one run of work.
+  for (let index = 0; index < 4; index++) {
+    await turn($, clock, `t${index}`, 8)
+    await clock.advance(2 * MINUTE)
+  }
+  expect(nags()).toBe(0)
+  expect(lineOf(await band($))).toBe(mood)
+
+  // A long turn: the run goes on while it runs, and passes fifty minutes.
+  await turn($, clock, 't4', 12)
+  expect(nags()).toBe(1)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    expect(lineOf(await band($, surface))).toContain('分鐘')
+  }
+  const dex = await $.command.run({ command: 'petdex', args: '' } as never)
+  expect(dex.text).toContain('已經連續寫 52 分鐘')
+
+  // Half an hour more, and it asks again.
+  await turn($, clock, 't5', 31)
+  expect(nags()).toBe(2)
+  expect(lineOf(await band($))).toContain('1 小時 23 分')
+
+  // A quarter of an hour away is a break: the walk is off.
+  await clock.advance(15 * MINUTE)
+  expect(lineOf(await band($))).toBe(mood)
+
+  // Back at it: the pet is glad about the walk, for a while.
+  await $.turn.start({ text: 'back', turnId: 't6' } as never)
+  const back = lineOf(await band($))
+  expect(back).toMatch(/回來|休息完|懶腰/)
+  await $.turn.complete({ turnId: 't6', answer: '', durationMs: 0, isAborted: false, reason: 'end_turn' } as never)
+  await clock.advance(11 * MINUTE)
+  expect(lineOf(await band($))).toBe(mood)
+  expect(nags()).toBe(2)
+  console.log(w.shown.join('\n'))
+})
+
+test('past midnight the pet yawns and says goodnight once; the quota scares still come first', { timeoutMs: 20_000 }, async ($, on) => {
+  const night = new Date(2026, 9, 4, 1, 30).getTime()
+  const clock = mock.clock(on, { now: night })
+  mock.store(on)
+  const w = world(on, limits(10, 20, night + 2 * HOUR, night + 4 * DAY))
+  await $.session.start(START)
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    expect(await band($, surface)).toContain('zZ')
+  }
+  await turn($, clock, 'n1', 1)
+  await turn($, clock, 'n2', 1)
+  const goodnights = w.shown.filter(text => text.includes('睡'))
+  expect(goodnights.length).toBe(1)
+  expect(goodnights[0]).toContain('01:3')
+
+  w.rateLimits = limits(92, 20, night + 2 * HOUR, night + 4 * DAY)
+  await measure($, w.rateLimits)
+  expect(await band($)).not.toContain('zZ')
+
+  // Morning: no more yawning.
+  w.rateLimits = limits(10, 20, night + 6 * HOUR, night + 4 * DAY)
+  await measure($, w.rateLimits)
+  await clock.advance(4 * HOUR)
+  expect(await band($)).not.toContain('zZ')
+  console.log(goodnights.join('\n'))
+})
+
+test('every pet acts out every scene', { timeoutMs: 60_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, limits(10, 20))
+  await $.session.start(START)
+  await clock.advance(1000)
+  // The preview's belly measures against the real threshold: 160k of 200k.
+  await eat($, w, 20_000)
+
+  const cells: Record<string, string> = { '肚子 70': '●●●●○', '肚子 95': '●●●●●' }
+  const scenes = ['深夜', '散步', '回來', '肚子 70', '肚子 95', '吐', '減肥']
+  for (const name of [...CATS, ...DOGS]) {
+    const rows: string[] = []
+    for (const scene of scenes) {
+      const said = await $.command.run({ command: 'petdex', args: `預覽 ${scene} ${name}` } as never)
+      expect(said.text).toContain('預覽「')
+      const drawn = await band($)
+      expect(drawn).toContain(name)
+      expect(drawn).toContain('（預覽中）')
+      if (scene === '深夜') expect(drawn).toContain('zZ')
+      if (scene === '散步') expect(lineOf(drawn)).toContain('52 分鐘')
+      if (scene.startsWith('肚子')) expect(drawn).toContain(`肚子 ${cells[scene]} ${scene.slice(3)}%`)
+      if (scene === '吐') expect(drawn).toContain('剛吐完')
+      rows.push(`${scene.padEnd(5, '　')} ${drawn.split(' 5h ')[0]}`)
+    }
+    console.log(rows.join('\n'))
+  }
+  // The scenes that pop a toast for real pop it in the preview too, marked as one.
+  const previews = w.shown.filter(text => text.startsWith('【預覽】'))
+  expect(previews.length).toBe((CATS.length + DOGS.length) * 5)
+  console.log(previews.slice(0, 10).join('\n'))
 })

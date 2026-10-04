@@ -1,7 +1,15 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, SessionRateLimit, Timer } from 'claude-code'
+import type { EngineInterface, Register, SessionContextUsage, SessionRateLimit, Timer } from 'claude-code'
 
-import type { QuotaPetsLife, QuotaPetsLimit } from '../types'
+import type {
+  QuotaPetsActivity,
+  QuotaPetsBelly,
+  QuotaPetsCompaction,
+  QuotaPetsLife,
+  QuotaPetsLimit,
+  QuotaPetsPreview,
+  QuotaPetsScene,
+} from '../types'
 
 type Rarity = 'N' | 'R' | 'SR' | 'SSR' | 'UR'
 type Kind = 'cat' | 'dog'
@@ -21,7 +29,22 @@ type Pet = {
   horrorAt?: number
   deadFace?: string
   deadLine?: string
+  yawnWrap?: (face: string) => string
+  nightLine?: string
+  // What the pet says with a full belly, then one about to burst.
+  bellyLines?: readonly [string, string]
 }
+
+// What the pet talks about when the quota leaves it room: the hour, a long run of work, its belly.
+type Aside =
+  | { kind: 'night'; time: string }
+  | { kind: 'walk'; ms: number }
+  | { kind: 'back' }
+  | { kind: 'slim'; isAuto: boolean }
+  | { kind: 'belly'; stage: 2 | 3 }
+
+// The belly as the band draws it: `fill` is how close auto-compaction is, 1 when it runs.
+type BellyView = { pct: number | null; fill: number | null; compacted: QuotaPetsCompaction | null }
 
 // What every cat, or every dog, falls back on when the pet brings nothing of its own.
 type Species = {
@@ -36,6 +59,16 @@ type Species = {
   horrorLines: readonly [readonly string[], readonly string[], readonly string[], readonly string[]]
   deadLines: readonly string[]
   warnings: readonly [string, string]
+  yawn: readonly string[]
+  nightLines: readonly string[]
+  nightToast: string
+  sleepNag: string
+  walkLines: readonly string[]
+  walkNags: readonly [string, string, string]
+  backLines: readonly string[]
+  bellyLines: readonly [readonly string[], readonly string[]]
+  burpLines: readonly string[]
+  slimLines: readonly string[]
 }
 
 // Kept in $.store so the collection and pity outlive the session. Each conversation's pet is its own key.
@@ -51,12 +84,23 @@ type Save = {
 const limitsAtom = atom({ plugin: 'quota-pets', key: 'limits' } as const, null)
 const lifeAtom = atom({ plugin: 'quota-pets', key: 'pet' } as const, null)
 const previewAtom = atom({ plugin: 'quota-pets', key: 'preview' } as const, null)
+const bellyAtom = atom({ plugin: 'quota-pets', key: 'belly' } as const, null)
+const activityAtom = atom({ plugin: 'quota-pets', key: 'activity' } as const, null)
 
 const PITY = 30
 const KEEP_LIVES = 50
-const HALF_HOUR = 30 * 60_000
+const MINUTE = 60_000
+const HALF_HOUR = 30 * MINUTE
 const DAY_MS = 24 * 3600_000
 const WEEK_MS = 7 * DAY_MS
+// Ten quiet minutes is a break; fifty minutes without one and the pet wants a walk, then asks every half hour.
+const BREAK_MS = 10 * MINUTE
+const WALK_AFTER = 50 * MINUTE
+const WALK_AGAIN = 30 * MINUTE
+const BACK_FOR = 10 * MINUTE
+const SLIM_FOR = 10 * MINUTE
+// Past midnight and before five, the pet is sleepy.
+const NIGHT_ENDS = 5
 
 const whiskers = (face: string) => `(=${face}=)`
 const floppy = (face: string) => `U${face}U`
@@ -88,6 +132,23 @@ const SPECIES: Readonly<Record<Kind, Species>> = {
     ],
     deadLines: ['它…會在 {cd} 後回來…', 'R.I.P. {name}，享年 5 小時', '我先走一步…{cd} 後見…'],
     warnings: ['燈…好像暗了一點…', '它…在看著你…'],
+    yawn: ['´ρ｀', '-ρ-', '˘ρ˘', '-ω-'],
+    nightLines: ['（打呵欠）都 {time} 了…還不睡喵？', '我先睡了喔…你也早點睡', '半夜寫的 code，明天的你會看不懂喵'],
+    nightToast: '已經 {time} 了…寫完這段就去睡吧喵',
+    sleepNag: '都 {time} 了，還連續寫了 {m}…真的該睡了喵',
+    walkLines: ['已經連續寫 {m}了…起來伸個懶腰嘛喵', '（用肉球拍你的手）{m}了，休息一下啦', '陪我去窗邊曬太陽好不好？都 {m}了'],
+    walkNags: [
+      '已經連續寫 {m}了，起來走走、喝口水吧喵',
+      '（跳上桌子）{m}了！真的該休息了喵',
+      '（直接躺在鍵盤上）{m}了…不休息，就別想打字了喵',
+    ],
+    backLines: ['休息回來了！精神好多了喵', '伸完懶腰了，繼續加油喵'],
+    bellyLines: [
+      ['肚子好撐…剛剛那些 token 好難消化', '吃太多了喵…要不要 /compact 一下？'],
+      ['再吃就要吐了喵…', '肚子快撐破了…毛球要出來了…'],
+    ],
+    burpLines: ['（吐了一顆毛球）…舒服多了喵', '剛剛吐掉的…是前面的對話嗎？有點想不起來了'],
+    slimLines: ['減肥成功！身輕如燕喵', '瘦下來了，又可以吃了喵'],
   },
   dog: {
     label: '狗',
@@ -114,6 +175,23 @@ const SPECIES: Readonly<Record<Kind, Species>> = {
     ],
     deadLines: ['（趴下裝死）…{cd} 後再叫我', 'R.I.P. {name}，好狗狗，享年 5 小時', '汪…沒電了…{cd} 後再陪你玩'],
     warnings: ['牠開始對著牆角低吼了…', '牠不叫了…它…在看著你…'],
+    yawn: ['´ρ｀', '-ρ-', '˘ᴥ˘', '-ᴥ-'],
+    nightLines: ['（打呵欠）主人，{time} 了，該睡覺了汪', '我已經在床邊等你了…', '（把你的拖鞋叼到床邊）'],
+    nightToast: '（打了個大呵欠）{time} 了…該睡了汪',
+    sleepNag: '（趴在你腳邊睡著了）{time} 了，你也連續寫了 {m}，該睡了',
+    walkLines: ['（叼著牽繩）{m}了！散步！散步！', '（坐在門口盯著你）都 {m}了，該出門走走了吧', '汪！{m}了！喝水！站起來！伸展！'],
+    walkNags: [
+      '（叼著牽繩跑過來）已經連續寫 {m}了，出去走走吧汪',
+      '（把牽繩放在你腳上）{m}了…散步…',
+      '（咬著你的褲管往門口拖）汪！{m}了！！',
+    ],
+    backLines: ['散步回來了！汪！精神百倍！', '（尾巴搖不停）休息完了，再來！'],
+    bellyLines: [
+      ['肚子圓滾滾了汪…', '吃太飽了，想趴著消化一下…要不要 /compact？'],
+      ['汪…再塞就要吐了…', '（翻肚躺平）一口都吃不下了…'],
+    ],
+    burpLines: ['（吐完）…汪，肚子空空的好舒服', '前面聊了什麼…我好像忘了汪'],
+    slimLines: ['減肥成功！可以再跑十圈汪', '瘦下來了！（原地轉圈）'],
   },
 }
 
@@ -136,6 +214,7 @@ const PETS: readonly Pet[] = [
     kind: 'cat',
     rarity: 'N',
     wrap: face => `(=  ${face}  =)`,
+    bellyLines: ['這點 token 才開胃而已', '好啦…我承認我吃太多了'],
     lines: {
       0: ['今天也是吃飽飽的一天', '罐罐呢？我說罐罐呢？'],
       1: ['剛剛那些 token 好吃嗎？分我一點', '我沒有偷吃額度，是它自己變少的'],
@@ -199,6 +278,7 @@ const PETS: readonly Pet[] = [
     kind: 'cat',
     rarity: 'R',
     wrap: face => `(=${face}=)っ旦`,
+    nightLine: '{time} 了…這個時間寫的 bug 特別多喔',
     lines: {
       0: ['這個 bug 不是我寫的喵', '今天也要準時下班（不可能）'],
       1: ['在我的電腦上是好的啊', '先寫個 TODO，之後再說'],
@@ -213,6 +293,7 @@ const PETS: readonly Pet[] = [
     wrap: whiskers,
     horrorAt: 70,
     faces: { 0: ['ↀωↀ', 'ↀ‿ↀ'], 1: ['ↀωↀ', 'ↀ_ↀ'], 2: ['ↀ∀ↀ', 'ↀωↀ'] },
+    nightLine: '深夜 {time}…正是我最喜歡的時段…',
     lines: {
       0: ['我只是隻普通的黑貓…真的', '聽說看到黑貓會帶來…算了，沒事'],
       1: ['要不要聽個故事？關於一個用光額度的人…', '今晚月色真美…額度也是'],
@@ -226,6 +307,7 @@ const PETS: readonly Pet[] = [
     rarity: 'R',
     wrap: face => `(=${face}=)っ[需求]`,
     deadLine: '這個 sprint 先到這，{cd} 後開檢討會',
+    nightLine: '{time} 了還在改？需求明天再說啦',
     lines: {
       0: ['這個很簡單吧？明天上線', '我不懂技術，但為什麼要這麼久？'],
       1: ['客戶說要改一下，就一下下', '這個需求跟上次的不衝突吧？（衝突）'],
@@ -283,6 +365,7 @@ const PETS: readonly Pet[] = [
       2: ['~~~(=_ω_=)~~~', '~~~(=；ω；=)~~~'],
     },
     horrorWrap: face => `~~~~(=${face}=)~~~~`,
+    yawnWrap: face => `~~(=${face}=)~~`,
     deadFace: '～～～～～～～～',
     deadLine: '貓是液體，這下證實了。{cd} 後請把我倒回來',
     lines: {
@@ -297,6 +380,7 @@ const PETS: readonly Pet[] = [
     kind: 'cat',
     rarity: 'UR',
     wrap: face => `✧˖°(=${face}=)°˖✧`,
+    nightLine: '凡人，{time} 了，吾命汝就寢',
     lines: {
       0: ['吾乃額度之神，跪下', '凡人，汝的額度吾已過目'],
       1: ['吾亦無法幫你加額度', '神也是要看帳單的'],
@@ -333,6 +417,7 @@ const PETS: readonly Pet[] = [
     kind: 'dog',
     rarity: 'N',
     wrap: face => `U${face}U═╤════╤═~`,
+    bellyLines: ['吃下去的 token 還在肚子裡排隊', '身體太長，吃的東西還沒到屁股就滿了…'],
     lines: {
       0: ['我的身體跟你的 stack trace 一樣長', '我很長，請耐心看完我'],
       1: ['頭已經到了，屁股還在上一個 commit', '你的 log 跟我一樣，越拉越長'],
@@ -361,6 +446,7 @@ const PETS: readonly Pet[] = [
     wrap: face => `U${face}U [加班中]`,
     faces: { 0: ['-ᴥ-', '˘ᴥ˘'], 1: ['ˇᴥˇ', '_ᴥ_'], 2: ['×ᴥ×;', 'ﾟДﾟ;'] },
     deadLine: '過勞了…{cd} 後打卡上班',
+    nightLine: '凌晨 {time}，責任制的夜晚才剛開始…',
     lines: {
       0: ['累得跟狗一樣，我就是那隻狗', '早安，今天也是責任制的一天'],
       1: ['責任制：責任是我的，制度是你的', '下班？那是什麼新的 API 嗎'],
@@ -453,6 +539,7 @@ const PETS: readonly Pet[] = [
     wrap: face => `U${face}U ◷`,
     deadFace: 'U˘ᴥ˘U ◷…',
     deadLine: '沒關係，我很會等。{cd} 後額度就回來了',
+    nightLine: '再晚我都會等你…可是 {time} 了，該睡了',
     lines: {
       0: ['你回來了！我一直在等你', '不管你去哪裡，我都在這裡等'],
       1: ['我在等…等你把這個 bug 修好', '你今天也會回來寫 code 對吧'],
@@ -510,6 +597,8 @@ const PETS: readonly Pet[] = [
     wrap: face => `✧˖°V${face}Vっ☾`,
     deadFace: '✧˖°V×ᴥ×V ☽ﾟ･',
     deadLine: '月亮吐回去了…{cd} 後吾再來吃',
+    nightLine: '{time} 了，吾要去吃月亮，汝該睡了',
+    bellyLines: ['吾連月亮都吃得下…這點 token…嗝', '連吾都吃不下了…再吃要把月亮吐出來了'],
     lines: {
       0: ['吾乃天狗，連月亮都吃得下，額度算什麼', '今晚的月亮，是吾吃掉的'],
       1: ['天狗食月，順便食額度', '月亮吃完了，接下來吃你的 token'],
@@ -677,6 +766,148 @@ function lane(week: QuotaPetsLimit, now: number, isScary: boolean): { glyph: str
     return eaten > day ? { glyph: 'ᗣ', color: 'warning' } : { glyph: 'ᗣ' }
   })
   return [...dots, { glyph: 'ᗧ', color: 'warning' }, ...ghosts]
+}
+
+// Read in the machine's own time zone: the pet keeps the person's hours.
+function isNight(now: number): boolean {
+  return new Date(now).getHours() < NIGHT_ENDS
+}
+
+function clockText(now: number): string {
+  const date = new Date(now)
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+}
+
+// The night a moment belongs to, so the pet says goodnight once a night.
+function nightOf(now: number): string {
+  const date = new Date(now)
+  return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`
+}
+
+// A run of work as the pet says it: 52 分鐘, 1 小時 10 分.
+function spanText(ms: number): string {
+  const minutes = Math.max(0, Math.floor(ms / MINUTE))
+  if (minutes < 60) return `${minutes} 分鐘`
+  const rest = minutes % 60
+  return rest === 0 ? `${Math.floor(minutes / 60)} 小時` : `${Math.floor(minutes / 60)} 小時 ${rest} 分`
+}
+
+function tokensText(tokens: number): string {
+  return tokens >= 1000 ? `${Math.round(tokens / 1000)}k` : String(tokens)
+}
+
+// How long this run of work has gone on; 0 once it has been quiet long enough to count as a break.
+function streakOf(activity: QuotaPetsActivity | null, now: number): number {
+  return activity !== null && now - activity.last < BREAK_MS ? now - activity.since : 0
+}
+
+// How close the context is to auto-compaction: 1 when it runs (the whole window when it is off or unknown).
+function fillOf(belly: QuotaPetsBelly): number | null {
+  const full = belly.threshold ?? belly.window
+  return belly.tokens === null || full <= 0 ? null : belly.tokens / full
+}
+
+function bellyStage(fill: number | null): 0 | 1 | 2 | 3 {
+  if (fill === null) return 0
+  if (fill >= 0.9) return 3
+  if (fill >= 0.75) return 2
+  return fill >= 0.5 ? 1 : 0
+}
+
+function gauge(fill: number): string {
+  const filled = Math.min(5, Math.max(0, Math.round(fill * 5)))
+  return '●'.repeat(filled) + '○'.repeat(5 - filled)
+}
+
+const NO_BELLY: BellyView = { pct: null, fill: null, compacted: null }
+
+// The belly the band draws: this conversation's, or the one a preview acts out.
+function bellyOf(held: QuotaPetsBelly | null, conv: number, shown: QuotaPetsPreview | null, now: number): BellyView {
+  const scene = shown?.scene ?? null
+  if (scene === 'belly') {
+    const pct = shown?.belly ?? 85
+    const full = held !== null && held.threshold !== null && held.window > 0 ? held.threshold / held.window : 1
+    return { pct, fill: pct / 100 / full, compacted: null }
+  }
+  if (scene === 'burp' || scene === 'slim') {
+    return { pct: null, fill: null, compacted: { at: now, isAuto: scene === 'burp', before: 167_000, after: 23_000 } }
+  }
+  if (held === null || held.conv !== conv) return NO_BELLY
+  return { pct: held.pct, fill: fillOf(held), compacted: held.compacted }
+}
+
+// The belly's cell in the band: how full it is, or that a compaction just emptied it.
+function bellyCell(belly: BellyView, now: number): { gauge: string; text: string; color: string } | null {
+  if (belly.pct !== null && belly.fill !== null) {
+    const stage = bellyStage(belly.fill)
+    return { gauge: gauge(belly.fill), text: `${belly.pct}%`, color: stage >= 3 ? 'error' : stage >= 2 ? 'warning' : 'success' }
+  }
+  if (belly.compacted !== null && now - belly.compacted.at < SLIM_FOR) {
+    return { gauge: gauge(0), text: belly.compacted.isAuto ? '剛吐完' : '剛減肥完', color: 'success' }
+  }
+  return null
+}
+
+function bellyAside(belly: BellyView): Aside | null {
+  const stage = bellyStage(belly.fill)
+  return stage === 2 || stage === 3 ? { kind: 'belly', stage } : null
+}
+
+// What the pet brings up, most pressing first: bedtime, a walk, coming back from one, a compaction, a full belly.
+function asideOf(now: number, activity: QuotaPetsActivity | null, belly: BellyView): Aside | null {
+  if (isNight(now)) return { kind: 'night', time: clockText(now) }
+  const streak = streakOf(activity, now)
+  if (streak >= WALK_AFTER) return { kind: 'walk', ms: streak }
+  if (activity !== null && activity.back !== null && now - activity.back < BACK_FOR) return { kind: 'back' }
+  if (belly.compacted !== null && now - belly.compacted.at < SLIM_FOR) return { kind: 'slim', isAuto: belly.compacted.isAuto }
+  return bellyAside(belly)
+}
+
+function sceneAside(scene: QuotaPetsScene, now: number, belly: BellyView): Aside | null {
+  if (scene === 'night') return { kind: 'night', time: isNight(now) ? clockText(now) : '02:17' }
+  if (scene === 'walk') return { kind: 'walk', ms: 52 * MINUTE }
+  if (scene === 'back') return { kind: 'back' }
+  if (scene === 'burp' || scene === 'slim') return { kind: 'slim', isAuto: scene === 'burp' }
+  return bellyAside(belly)
+}
+
+function yawnOf(pet: Pet, seed: number): string {
+  return `${(pet.yawnWrap ?? pet.wrap)(pick(SPECIES[pet.kind].yawn, pet.id, seed))} zZ`
+}
+
+function asideLine(pet: Pet, aside: Aside, seed: number): string {
+  const species = SPECIES[pet.kind]
+  if (aside.kind === 'night') return (pet.nightLine ?? pick(species.nightLines, pet.id, seed)).replace('{time}', aside.time)
+  if (aside.kind === 'walk') return pick(species.walkLines, pet.id, seed).replace('{m}', spanText(aside.ms))
+  if (aside.kind === 'back') return pick(species.backLines, pet.id, seed)
+  if (aside.kind === 'slim') return pick(aside.isAuto ? species.burpLines : species.slimLines, pet.id, seed)
+  const isBursting = aside.stage === 3
+  const own = isBursting ? pet.bellyLines?.[1] : pet.bellyLines?.[0]
+  return own ?? pick(isBursting ? species.bellyLines[1] : species.bellyLines[0], pet.id, seed)
+}
+
+function bellyToast(pet: Pet, pct: number | null, hasThreshold: boolean): string {
+  const tail = hasThreshold ? '再吃就要吐了（快要自動壓縮了）' : '可以 /compact 幫牠消化一下'
+  return `${portrait(pet)} 肚子快撐爆了（context ${pct ?? '?'}%）…${tail}`
+}
+
+function slimToast(pet: Pet, compacted: QuotaPetsCompaction): string {
+  const { isAuto, before, after } = compacted
+  const change = before !== null && after !== null ? `肚子從 ${tokensText(before)} ${isAuto ? '縮' : '瘦'}到 ${tokensText(after)}` : ''
+  return isAuto
+    ? `${portrait(pet)} 撐到吐了…（自動壓縮）${change}`
+    : `${portrait(pet)} 減肥成功！${change === '' ? '身輕如燕' : change}`
+}
+
+function walkToast(pet: Pet, ms: number, nags: number, now: number): string {
+  const species = SPECIES[pet.kind]
+  const m = spanText(ms)
+  if (isNight(now)) return `${yawnOf(pet, now)} ${species.sleepNag.replace('{time}', clockText(now)).replace('{m}', m)}`
+  return `${portrait(pet)} ${(species.walkNags[Math.min(nags, 2)] ?? '').replace('{m}', m)}`
+}
+
+function nightToast(pet: Pet, now: number): string {
+  return `${yawnOf(pet, now)} ${SPECIES[pet.kind].nightToast.replace('{time}', clockText(now))}`
 }
 
 function critLine(delta: number): string {
@@ -889,6 +1120,105 @@ async function ingest($: EngineInterface, rateLimits: readonly SessionRateLimit[
   await update($, lifeAtom, () => life)
 }
 
+async function petNow($: EngineInterface): Promise<Pet | null> {
+  const life = await read($, lifeAtom)
+  return life === null ? null : petById(life.id)
+}
+
+// A new reading of the context window: the belly fills, and says so once when it is about to burst.
+async function digest($: EngineInterface, context: SessionContextUsage): Promise<void> {
+  const { startedAt: conv } = await $.session.usage()
+  const prior = await read($, bellyAtom)
+  const isSame = prior !== null && prior.conv === conv
+  const { window, percent } = context
+  const tokens = context.tokens ?? (percent === undefined ? null : Math.round((percent / 100) * window))
+  const pct = percent ?? (tokens === null || window <= 0 ? null : Math.round((tokens / window) * 100))
+  let belly: QuotaPetsBelly = {
+    conv,
+    tokens,
+    pct,
+    window,
+    threshold: prior !== null && prior.window === window ? prior.threshold : null,
+    warned: isSame && prior.warned,
+    compacted: isSame ? prior.compacted : null,
+  }
+  const stage = bellyStage(fillOf(belly))
+  if (stage === 3 && !belly.warned) {
+    const pet = await petNow($)
+    if (pet !== null) $.ui.toast(bellyToast(pet, pct, belly.threshold !== null), { timeoutMs: 10_000 })
+    belly = { ...belly, warned: true }
+  } else if (stage < 2 && belly.warned) {
+    belly = { ...belly, warned: false }
+  }
+  await update($, bellyAtom, () => belly)
+}
+
+// The windows whose compaction threshold was already asked for, so a session with it off asks once.
+const learned = new Set<number>()
+
+// The token count auto-compaction runs at, from the engine's local estimate: no request is sent.
+async function learn($: EngineInterface): Promise<void> {
+  const usage = await $.session.usage({ breakdown: 'summary' })
+  const { window, breakdown } = usage.context
+  learned.add(window)
+  const threshold = breakdown?.isAutoCompactEnabled === true ? (breakdown.autoCompactThreshold ?? null) : null
+  await update($, bellyAtom, prior => (prior !== null && prior.window === window ? { ...prior, threshold } : prior))
+}
+
+// Off the hook's path: the estimate reads the whole context.
+function learnLater($: EngineInterface): void {
+  $.clock.after(0, () => {
+    void serial(() => learn($)).catch(error => $.ui.log(`compaction threshold unknown: ${String(error)}`, { to: 'debug' }))
+  })
+}
+
+// A compaction empties the belly: an auto one is the pet throwing up, a /compact is a diet that worked.
+async function slim($: EngineInterface, isAuto: boolean, before: number | null, after: number | null): Promise<void> {
+  const now = await $.clock.now()
+  const { startedAt: conv, context } = await $.session.usage()
+  const compacted: QuotaPetsCompaction = { at: now, isAuto, before, after }
+  await update($, bellyAtom, prior => ({
+    conv,
+    tokens: null,
+    pct: null,
+    window: prior?.window ?? context.window,
+    threshold: prior?.threshold ?? null,
+    warned: false,
+    compacted,
+  }))
+  const pet = await petNow($)
+  if (pet !== null) $.ui.toast(slimToast(pet, compacted), { timeoutMs: 10_000 })
+}
+
+// A sign the session is at work (a turn starting or ending, a minute of one running): it starts a run or keeps one going.
+async function stir($: EngineInterface, now: number): Promise<void> {
+  const prior = await read($, activityAtom)
+  let activity: QuotaPetsActivity =
+    prior === null
+      ? { since: now, last: now, nags: 0, back: null, night: null }
+      : now - prior.last >= BREAK_MS
+        ? { ...prior, since: now, last: now, nags: 0, back: prior.nags > 0 ? now : null }
+        : { ...prior, last: now }
+  if (isNight(now) && activity.night !== nightOf(now)) {
+    const pet = await petNow($)
+    if (pet !== null) $.ui.toast(nightToast(pet, now), { timeoutMs: 10_000 })
+    activity = { ...activity, night: nightOf(now) }
+  }
+  await update($, activityAtom, () => activity)
+}
+
+// Every minute: a running turn keeps the run of work going, and a long run has the pet asking for a walk.
+async function tick($: EngineInterface, isBusy: boolean): Promise<void> {
+  const now = await $.clock.now()
+  if (isBusy) await stir($, now)
+  const activity = await read($, activityAtom)
+  const streak = streakOf(activity, now)
+  if (activity === null || streak < WALK_AFTER + activity.nags * WALK_AGAIN) return
+  const pet = await petNow($)
+  if (pet !== null) $.ui.toast(walkToast(pet, streak, activity.nags, now), { timeoutMs: 12_000 })
+  await update($, activityAtom, value => (value === null ? null : { ...value, nags: value.nags + 1 }))
+}
+
 async function dexText($: EngineInterface): Promise<string> {
   const save = await serial(() => load($))
   const life = await read($, lifeAtom)
@@ -907,7 +1237,13 @@ async function dexText($: EngineInterface): Promise<string> {
   if (life !== null) {
     const pet = petById(life.id)
     const dead = life.isDead ? '（已陣亡，等待轉生）' : ''
-    current = `這個對話：${portrait(pet)} ${pet.name} [${pet.rarity}]，上工 ${dur(now - life.since)}${dead}`
+    const belly = await read($, bellyAtom)
+    const streak = streakOf(await read($, activityAtom), now)
+    const extras = [
+      belly !== null && belly.conv === life.conv && belly.pct !== null ? `肚子 ${belly.pct}%` : null,
+      streak >= MINUTE ? `已經連續寫 ${spanText(streak)}` : null,
+    ].filter((extra): extra is string => extra !== null)
+    current = `這個對話：${portrait(pet)} ${pet.name} [${pet.rarity}]，上工 ${dur(now - life.since)}${dead}${extras.map(extra => `｜${extra}`).join('')}`
   }
   const { cat, dog } = SPECIES
   return [
@@ -922,6 +1258,8 @@ async function dexText($: EngineInterface): Promise<string> {
     ...save.history.map(line => `・${line}`),
     '',
     '玩法：/petdex 試抽 ｜ /petdex 十連 ｜ /petdex 預覽 ｜ /petdex 預覽 95 柴犬',
+    '　　　/petdex 預覽 深夜｜散步｜回來｜肚子 85｜吐｜減肥（可以接名字）',
+    '肚子是 context：快自動壓縮時會撐、壓縮完會吐（/compact 是減肥）。連續寫 50 分鐘會吵著散步，半夜會催你睡。',
   ].join('\n')
 }
 
@@ -937,9 +1275,49 @@ function trialText(times: number): string {
 
 let tour: Timer | null = null
 
+const SCENES: Readonly<Record<string, QuotaPetsScene>> = {
+  深夜: 'night',
+  night: 'night',
+  散步: 'walk',
+  walk: 'walk',
+  回來: 'back',
+  back: 'back',
+  肚子: 'belly',
+  belly: 'belly',
+  吐: 'burp',
+  burp: 'burp',
+  減肥: 'slim',
+  slim: 'slim',
+}
+const SCENE_LABEL: Record<QuotaPetsScene, string> = {
+  night: '深夜',
+  walk: '散步',
+  back: '散步回來',
+  belly: '肚子',
+  burp: '撐到吐',
+  slim: '減肥成功',
+}
+
+// The toast a scene would pop for real, if it pops one: acted out at an hour that fits it.
+async function sceneToast($: EngineInterface, pet: Pet, preview: QuotaPetsPreview, now: number): Promise<string | null> {
+  const scene = preview.scene ?? null
+  if (scene === 'night') return nightToast(pet, isNight(now) ? now : new Date(now).setHours(2, 17, 0, 0))
+  if (scene === 'walk') return walkToast(pet, 52 * MINUTE, 0, isNight(now) ? new Date(now).setHours(15, 0, 0, 0) : now)
+  if (scene === 'burp' || scene === 'slim') {
+    return slimToast(pet, { at: now, isAuto: scene === 'burp', before: 167_000, after: 23_000 })
+  }
+  if (scene !== 'belly') return null
+  const held = await read($, bellyAtom)
+  const belly = bellyOf(held, held?.conv ?? 0, preview, now)
+  return bellyStage(belly.fill) === 3 ? bellyToast(pet, belly.pct, held !== null && held.threshold !== null) : null
+}
+
 async function startPreview($: EngineInterface, words: readonly string[]): Promise<string> {
-  const pctWord = words.find(word => /^\d{1,3}$/.test(word))
-  const petWord = words.find(word => !/^\d{1,3}$/.test(word))
+  const isNumber = (word: string) => /^\d{1,3}$/.test(word)
+  const pctWord = words.find(isNumber)
+  const sceneWord = words.find(word => SCENES[word] !== undefined)
+  const scene = sceneWord === undefined ? null : (SCENES[sceneWord] ?? null)
+  const petWord = words.find(word => !isNumber(word) && SCENES[word] === undefined)
   const chosen = petWord === undefined ? undefined : PETS.find(pet => pet.name === petWord || pet.id === petWord)
   if (petWord !== undefined && chosen === undefined) {
     const names = (kind: Kind) => PETS.filter(pet => pet.kind === kind).map(pet => pet.name).join('、')
@@ -949,11 +1327,26 @@ async function startPreview($: EngineInterface, words: readonly string[]): Promi
   const now = await $.clock.now()
   tour?.cancel()
   tour = null
+  // A later preview outlives this one's timer.
+  const until = now + 60_000
+  const clear = () => void update($, previewAtom, value => (value?.until === until ? null : value)).catch(() => undefined)
+
+  if (scene !== null) {
+    const belly = scene === 'belly' ? Math.min(100, Number(pctWord ?? 85)) : null
+    const preview: QuotaPetsPreview = { pct: 20, until, petId, scene, belly }
+    await update($, previewAtom, () => preview)
+    $.clock.after(60_500, clear)
+    const pet = chosen ?? (await petNow($))
+    const toast = pet === null ? null : await sceneToast($, pet, preview, now)
+    if (toast !== null) $.ui.toast(`【預覽】${toast}`, { timeoutMs: 10_000 })
+    const label = scene === 'belly' ? `肚子 ${belly}%` : SCENE_LABEL[scene]
+    return `預覽「${label}」一分鐘（只是演的，真實的時間、context 都沒有動）`
+  }
 
   if (pctWord !== undefined) {
     const pct = Math.min(100, Number(pctWord))
-    await update($, previewAtom, () => ({ pct, until: now + 60_000, petId }))
-    $.clock.after(60_500, () => void update($, previewAtom, () => null).catch(() => undefined))
+    await update($, previewAtom, () => ({ pct, until, petId }))
+    $.clock.after(60_500, clear)
     return `預覽 ${pct}% 一分鐘（只是演的，真實額度沒有動）`
   }
 
@@ -976,17 +1369,24 @@ async function startPreview($: EngineInterface, words: readonly string[]): Promi
 
 export const register: Register = on => {
   let turnStart: { turnId: string; pct: number; window: number | null } | null = null
+  // The turns running now: while one runs, the session is at work.
+  const running = new Set<string>()
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'petdex',
       description: '額度寵物圖鑑：抽過的貓狗、陣亡紀錄、保底（試抽／十連／預覽）',
-      argumentHint: '[試抽 | 十連 | 預覽 [0-100] [名字]]',
+      argumentHint: '[試抽 | 十連 | 預覽 [0-100 | 深夜 | 散步 | 肚子 0-100 | 吐 | 減肥] [名字]]',
     })
     const usage = await $.session.usage()
     await serial(() => ingest($, usage.rateLimits))
-    // The countdowns move even when the percent does not.
-    $.clock.every(60_000, () => $.ui.invalidate('ui.render'))
+    await serial(() => digest($, usage.context))
+    learnLater($)
+    // The countdowns move even when the percent does not, and a run of work grows by the minute.
+    $.clock.every(MINUTE, () => {
+      void serial(() => tick($, running.size > 0)).catch(error => $.ui.log(`tick failed: ${String(error)}`, { to: 'debug' }))
+      $.ui.invalidate('ui.render')
+    })
 
     return next(e)
   })
@@ -996,11 +1396,27 @@ export const register: Register = on => {
     if (e.changed.includes('rateLimits')) {
       await serial(() => ingest($, e.rateLimits))
     }
+    if (e.changed.includes('context')) {
+      await serial(() => digest($, e.context))
+      // Another model, another window: its threshold is asked for once.
+      if (!learned.has(e.context.window)) learnLater($)
+    }
+
+    return result
+  })
+
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined && e.trigger !== 'precompute' && result.messages !== undefined) {
+      const { tokensBefore = null, tokensAfter = null } = result
+      await serial(() => slim($, e.trigger !== 'manual', tokensBefore, tokensAfter))
+    }
 
     return result
   })
 
   on('turn.start', async ($, e, next) => {
+    running.add(e.turnId)
     const usage = await $.session.usage()
     const life = await read($, lifeAtom)
     // /clear starts a new conversation in the same session, and a new conversation pulls its own pet.
@@ -1010,12 +1426,19 @@ export const register: Register = on => {
     const limits = await read($, limitsAtom)
     const five = limits?.five ?? null
     turnStart = five === null ? null : { turnId: e.turnId, pct: five.pct, window: five.resetsAt }
+    const now = await $.clock.now()
+    await serial(() => stir($, now))
 
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
+    running.delete(e.turnId)
+    if (e.agentId === undefined) {
+      const now = await $.clock.now()
+      await serial(() => stir($, now))
+    }
     const start = turnStart
     if (e.agentId === undefined && start !== null && start.turnId === e.turnId) {
       turnStart = null
@@ -1049,8 +1472,11 @@ export const register: Register = on => {
 
     const limits = await read($, limitsAtom)
     const preview = await read($, previewAtom)
+    const activity = await read($, activityAtom)
     const now = await $.clock.now()
     const shown = preview !== null && preview.until > now ? preview : null
+    const scene = shown?.scene ?? null
+    const belly = bellyOf(await read($, bellyAtom), held.conv, shown, now)
     const pet = petById(shown?.petId ?? held.id)
     const five: QuotaPetsLimit | null =
       shown === null
@@ -1068,15 +1494,26 @@ export const register: Register = on => {
       say = held.isDead
         ? `額度重置了！說句話就開扭蛋（${pet.name}轉生中…）`
         : '額度重置了！說句話就能開新扭蛋'
-    } else if (five !== null) {
-      stage = (shown === null && held.isDead) || five.pct >= 100 ? 'dead' : stageOf(five.pct, pet)
-      const seed = Math.floor(five.pct)
-      face = faceOf(pet, stage, seed, e.props.isWorking)
-      say = sayOf(pet, stage, seed, countdown)
+    } else {
+      if (five !== null) {
+        stage = (shown === null && held.isDead) || five.pct >= 100 ? 'dead' : stageOf(five.pct, pet)
+        const seed = Math.floor(five.pct)
+        face = faceOf(pet, stage, seed, e.props.isWorking)
+        say = sayOf(pet, stage, seed, countdown)
+      }
+      // The ghost stories and the death keep the floor; otherwise the pet may bring up something else.
+      // A quota preview shows the quota alone.
+      const aside = scene !== null ? sceneAside(scene, now, belly) : shown === null ? asideOf(now, activity, belly) : null
+      if (aside !== null && (stage === null || typeof stage === 'number')) {
+        const seed = Math.floor(now / (10 * MINUTE))
+        if (aside.kind === 'night') face = yawnOf(pet, seed)
+        say = asideLine(pet, aside, seed)
+      }
     }
     const isCreepy = stage === 'h1' || stage === 'h2' || stage === 'h3' || stage === 'peek'
     const faceColor = isCreepy ? 'error' : stage === 2 ? 'warning' : undefined
     const food = week === null ? null : foodLine(week, now)
+    const cell = bellyCell(belly, now)
     const paint = (color: string | undefined) => (color === undefined ? {} : { color })
 
     const { Box, Text } = $.ui.resolve(e)
@@ -1095,7 +1532,7 @@ export const register: Register = on => {
             {`「${say}」`}
           </Text>
         </Box>
-        {(five !== null || food !== null) && (
+        {(five !== null || food !== null || cell !== null) && (
           <Box flexDirection="row" flexWrap="wrap" columnGap={3}>
             {five !== null && !isOver && (
               <Box flexDirection="row" columnGap={1}>
@@ -1120,6 +1557,13 @@ export const register: Register = on => {
                 <Text dimColor wrap="truncate-end">
                   {`· ${food.text}`}
                 </Text>
+              </Box>
+            )}
+            {cell !== null && (
+              <Box flexDirection="row" columnGap={1}>
+                <Text dimColor>肚子</Text>
+                <Text color={cell.color}>{cell.gauge}</Text>
+                <Text>{cell.text}</Text>
               </Box>
             )}
             {shown !== null && <Text color="magenta">（預覽中）</Text>}
