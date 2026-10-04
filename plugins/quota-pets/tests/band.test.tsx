@@ -4,7 +4,8 @@ import type { On, RenderElement, SessionRateLimit } from 'claude-code'
 
 const NOW = Date.parse('2026-10-03T10:00:00Z')
 const HOUR = 3600_000
-const DOGS = ['米克斯', '柴犬', '臘腸狗', '哈士奇', '黃金獵犬', '吉娃娃', '狗狗幣', '忠犬八公', '地獄三頭犬', '天狗']
+const CATS = ['普通貓', '橘貓', '賓士貓', '鍵盤貓', '實習生貓', '墨鏡貓', '工程師貓', '黑貓', 'PM貓', '招財貓', '太空貓', '薛丁格的貓', '液態貓', '貓神']
+const DOGS = ['米克斯', '柴犬', '臘腸狗', '單身狗', '社畜狗', '哈士奇', '黃金獵犬', '吉娃娃', '舔狗', '看門狗', '狗狗幣', '忠犬八公', '熱狗', '狗頭軍師', '地獄三頭犬', '天狗']
 const START = { cwd: '.', surface: 'terminal', isInteractive: true } as never
 
 function limits(five: number, week: number, fiveResetsAt = NOW + 2 * HOUR): SessionRateLimit[] {
@@ -152,13 +153,13 @@ test('a conversation started after the quota ran out pulls a pet that is dead on
   console.log(drawn)
 })
 
-test('every dog draws at every stage of the quota', { timeoutMs: 60_000 }, async ($, on) => {
+test('every pet draws at every stage of the quota', { timeoutMs: 60_000 }, async ($, on) => {
   mock.clock(on, { now: NOW })
   mock.store(on)
   world(on, limits(10, 20))
   await $.session.start(START)
 
-  for (const name of DOGS) {
+  for (const name of [...CATS, ...DOGS]) {
     const rows: string[] = []
     for (const pct of [10, 45, 70, 87, 92, 96, 99, 100]) {
       const said = await $.command.run({ command: 'petdex', args: `預覽 ${pct} ${name}` } as never)

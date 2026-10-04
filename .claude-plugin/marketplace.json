@@ -3,14 +3,14 @@
   "owner": { "name": "ivers" },
   "metadata": {
     "description": "我的 Claude Code mods",
-    "version": "0.2.1"
+    "version": "0.3.0"
   },
   "plugins": [
     {
       "name": "quota-pets",
       "source": "./plugins/quota-pets",
       "description": "額度寵物扭蛋：每個對話抽一隻顏文字貓或狗，額度快用完會講鬼故事、用完會陣亡、重置後轉生",
-      "version": "0.2.1"
+      "version": "0.3.0"
     }
   ]
 }
