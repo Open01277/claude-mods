@@ -38,6 +38,8 @@ type World = {
   files: Map<string, string>
   messages: unknown[]
   bash: unknown
+  // What the next PowerShell command does to the files.
+  shell: (() => void) | undefined
   status: string | undefined
   opened: string[]
   toasts: string[]
@@ -53,6 +55,7 @@ function world(on: On, files: Readonly<Record<string, string>>, root = ROOT): Wo
     files: new Map(Object.entries(files).map(([path, text]) => [spelled(path), text])),
     messages: [],
     bash: undefined,
+    shell: undefined,
     status: undefined,
     opened: [],
     toasts: [],
@@ -117,9 +120,83 @@ function world(on: On, files: Readonly<Record<string, string>>, root = ROOT): Wo
       const result = { stdout: '', stderr: '', interrupted: false, ...(w.bash === undefined ? {} : { bashEditDiff: w.bash }) }
       return (isReadOnly ? { result, isReadOnly } : { result }) as never
     }
+    if (call.tool === 'PowerShell') {
+      // Its record names no files, as the engine's does.
+      w.shell?.()
+      w.shell = undefined
+      const result = { stdout: '', stderr: '', interrupted: false, isImage: false }
+      return (call.command.startsWith('Get-') ? { result, isReadOnly: true } : { result }) as never
+    }
     return { result: {} } as never
   })
   return w
+}
+
+type Git = { indexes: Set<string>; calls: string[][] }
+
+// Git beneath the plugin, over the world's files: `add -A` and `write-tree` hash them into trees, `diff-tree` and
+// `cat-file` read those back. Blobs store LF, as core.autocrlf does on Windows.
+function fakeGit(on: On, w: World, top = 'D:/proj'): Git {
+  const git: Git = { indexes: new Set(), calls: [] }
+  const ids = new Map<string, string>()
+  const blobs = new Map<string, string>()
+  const trees = new Map<string, Map<string, string>>()
+  let staged = new Map<string, string>()
+  const idOf = (key: string) => {
+    const id = ids.get(key) ?? (ids.size + 1).toString(16).padStart(40, '0')
+    ids.set(key, id)
+    return id
+  }
+  const said = (stdout: string, exitCode = 0) => ({ value: { ...RAN, stdout, exitCode } }) as never
+  const prefix = `${top.toLowerCase()}/`
+  on('fs.list', () => ({ value: [] }) as never)
+  on('process.run', ($, e) => {
+    const { argv, init } = e as { argv: string[]; init?: { env?: Record<string, string> } }
+    if (argv[0] !== 'git') return { value: RAN } as never
+    const args = argv[1] === '-c' ? argv.slice(3) : argv.slice(1)
+    git.calls.push(args)
+    const index = init?.env?.GIT_INDEX_FILE
+    if (index !== undefined) git.indexes.add(index)
+    // Every snapshot goes through an index; nothing else is run on one.
+    if ((args[0] === 'add' || args[0] === 'write-tree') !== (index !== undefined)) return said('', 128)
+    const [verb, ...rest] = args
+    if (verb === 'rev-parse') return said(rest[0] === '--show-toplevel' ? `${top}\n` : `${top}/.git\n`)
+    if (verb === 'add') {
+      staged = new Map()
+      for (const [path, text] of w.files) {
+        if (!path.startsWith(prefix)) continue
+        const blob = text.replace(/\r\n/g, '\n')
+        const id = idOf(`blob:${blob}`)
+        blobs.set(id, blob)
+        staged.set(path.slice(prefix.length), id)
+      }
+      return said('')
+    }
+    if (verb === 'write-tree') {
+      const id = idOf(`tree:${JSON.stringify([...staged].sort())}`)
+      trees.set(id, staged)
+      return said(`${id}\n`)
+    }
+    if (verb === 'diff-tree') {
+      const [before, after] = rest.slice(-2).map(id => trees.get(id ?? '') ?? new Map<string, string>())
+      const out: string[] = []
+      for (const rel of [...new Set([...(before?.keys() ?? []), ...(after?.keys() ?? [])])].sort()) {
+        const old = before?.get(rel)
+        const now = after?.get(rel)
+        if (old === now) continue
+        const none = '0'.repeat(40)
+        const status = old === undefined ? 'A' : now === undefined ? 'D' : 'M'
+        out.push(`:${old === undefined ? '000000' : '100644'} ${now === undefined ? '000000' : '100644'} ${old ?? none} ${now ?? none} ${status}`, rel)
+      }
+      return said(out.length === 0 ? '' : `${out.join('\0')}\0`)
+    }
+    if (verb === 'cat-file') {
+      const blob = blobs.get(rest[1] ?? '')
+      return blob === undefined ? said('', 128) : said(blob)
+    }
+    return said('', 128)
+  })
+  return git
 }
 
 async function drawn($: Engine, surface: (typeof SURFACES)[number] = 'terminal'): Promise<string> {
@@ -528,4 +605,125 @@ test('Revert puts a file back after a yes, tells the model, and can be undone un
   expect(await ui.find({ key: 'u0' })).toBeUndefined()
   await ui.unmount()
   console.log(w.toasts.join('\n'))
+})
+
+test('PowerShell commands are followed through git snapshots of the work tree', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const C = 'D:\\proj\\c.txt'
+  const D = 'D:\\proj\\d.txt'
+  const E = 'D:\\proj\\e.txt'
+  const w = world(on, { [A]: 'one\ntwo\n', [B]: 'b1\r\nb2\r\n', [D]: 'gone\n' })
+  const git = fakeGit(on, w)
+  await $.session.start(START)
+  await clock.advance(1000)
+
+  // Changed by an Edit first: its base is its text before that, whatever the snapshots see later.
+  await edit($, A, 'two', 'TWO')
+  // Another session changes b.txt before the command: that change is not this conversation's.
+  w.files.set(spelled(B), 'b1 elsewhere\r\nb2\r\n')
+  w.shell = () => {
+    w.files.set(spelled(A), 'one\nTWO\nthree\n')
+    w.files.set(spelled(B), 'b1 elsewhere\r\nB2\r\n')
+    w.files.set(spelled(C), 'made\n')
+    w.files.delete(spelled(D))
+  }
+  await $.tool.call({ tool: 'PowerShell', command: "Set-Content b.txt 'B2'; Remove-Item d.txt" } as never)
+  await clock.advance(1000)
+
+  for (const surface of SURFACES) {
+    const text = await drawn($, surface)
+    expect(text).toContain('這個對話改了 4 個檔案')
+    expect(text).toContain('-two')
+    expect(text).toContain('+three')
+    expect(text).toContain('-b2')
+    expect(text).toContain('+B2')
+    expect(text).not.toContain('-b1')
+    expect(text).toContain('c.txt')
+    expect(text).toContain('+made')
+    expect(text).toContain('d.txt')
+    expect(text).toContain('-gone')
+    expect(text).not.toContain('無法比對')
+  }
+  // The snapshots go to an index of the plugin's own, never the repo's.
+  expect([...git.indexes]).toHaveLength(1)
+  expect([...git.indexes][0]).toMatch(/^D:\/proj\/\.git\/convo-diff-[0-9a-z]+\.index$/)
+
+  // A read-only command follows nothing, even when a file changes meanwhile (the person typing in an editor).
+  const before = git.calls.length
+  w.shell = () => w.files.set(spelled(E), 'typed by the person\n')
+  await $.tool.call({ tool: 'PowerShell', command: 'Get-ChildItem' } as never)
+  await clock.advance(1000)
+  expect(await drawn($)).not.toContain('e.txt')
+  expect(git.calls.slice(before).filter(args => args[0] === 'add')).toHaveLength(1)
+
+  // A revert puts back the text the snapshot saw, with the CRLF the file has: git stored it with LF.
+  const ui = await mountPane($)
+  await ui.press({ key: 'r1' })
+  await ui.press({ key: 'rc1' })
+  expect(w.files.get(spelled(B))).toBe('b1 elsewhere\r\nb2\r\n')
+  await ui.unmount()
+})
+
+test('with no git repo, PowerShell commands still run and follow nothing', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, { [A]: 'one\n' })
+  on('process.run', () => ({ value: { ...RAN, exitCode: 128, stderr: 'fatal: not a git repository' } }) as never)
+  await $.session.start(START)
+  await clock.advance(1000)
+
+  w.shell = () => w.files.set(spelled(A), 'uno\n')
+  const ran = await $.tool.call({ tool: 'PowerShell', command: "Set-Content a.txt 'uno'" } as never)
+  expect((ran as { deny?: string }).deny).toBeUndefined()
+  await clock.advance(1000)
+  expect(await drawn($)).toContain('這個對話還沒有改任何檔案')
+  expect(w.files.get(spelled(A))).toBe('uno\n')
+})
+
+const BAND_PROPS = { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 100 } as const
+
+async function mountBand($: Engine, surface: (typeof SURFACES)[number]) {
+  return $.ui.mount({ plugin: 'convo-diff', surface, component: 'AbovePrompt', props: BAND_PROPS as never })
+}
+
+test('on the desktop a button above the prompt opens the pane, under what other plugins draw there', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, { [A]: 'one\n', [B]: 'b\n' })
+  // Another plugin's band beneath this one, as quota-pets draws.
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>(=^･ω･^=) 橘貓</Text>
+  })
+  await $.session.start(START)
+  await clock.advance(1000)
+
+  // Nothing changed yet: no button, the other band as it was.
+  let ui = await mountBand($, 'desktop')
+  expect(await ui.find({ key: 'open' })).toBeUndefined()
+  expect(textOf(await ui.drawn())).toContain('橘貓')
+  await ui.unmount()
+
+  await edit($, A, 'one', 'uno')
+  await edit($, B, 'b', 'bee')
+  await clock.advance(1000)
+  ui = await mountBand($, 'desktop')
+  const text = textOf(await ui.drawn())
+  expect(text).toContain('橘貓')
+  expect(text).toContain('對話 diff')
+  expect(text).toContain('這個對話改了 2 個檔案')
+  expect(text).toContain('+2')
+  expect(text).toContain('-2')
+  expect(text.indexOf('橘貓')).toBeLessThan(text.indexOf('對話 diff'))
+  expect(w.opened).toHaveLength(0)
+  await ui.press({ key: 'open' })
+  expect(w.opened).toEqual(['convo-diff'])
+  await ui.unmount()
+
+  // The terminal keeps /convo-diff and the status line: the band stays the other plugin's.
+  ui = await mountBand($, 'terminal')
+  expect(await ui.find({ key: 'open' })).toBeUndefined()
+  expect(textOf(await ui.drawn())).toContain('橘貓')
+  await ui.unmount()
 })

@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, Timer } from 'claude-code'
+import type { EngineInterface, Register, Timer, UiOpenResult } from 'claude-code'
 
 import type {
   ConvoDiffBase,
@@ -11,11 +11,15 @@ import type {
 } from '../types'
 import { diffText, isBinary, unapply } from './diff'
 import type { Hunk } from './diff'
+import { gitArgv, isLeftover, parseRaw, withEol } from './git'
 
+const PLUGIN = 'convo-diff'
 const PANE = 'convo-diff'
 const TITLE = '對話 diff'
 const COMMAND = 'convo-diff'
 const TOOL = 'mcp__convo-diff__diff'
+// The band's button that opens the pane, on the desktop.
+const OPEN = 'open'
 
 const trackAtom = atom({ plugin: 'convo-diff', key: 'track' } as const, null)
 const viewAtom = atom({ plugin: 'convo-diff', key: 'view' } as const, null)
@@ -33,6 +37,11 @@ const STORE_ONE = 1536 * 1024
 const KEEP_CONVS = 20
 // A revert keeps the text it replaced, for an undo, up to this size.
 const UNDO_MAX = 1024 * 1024
+const GIT_TIMEOUT_MS = 20_000
+// A snapshot slower than this (past the first, which hashes every file) is too slow to take around every command.
+const SNAP_SLOW_MS = 3000
+// The most files one command gives a base to; past it, the rest are followed with their bases lost.
+const SNAP_MAX_BASES = 100
 
 const STATUS_LABEL: Record<ConvoDiffStatus, string> = {
   added: '新增',
@@ -538,6 +547,109 @@ async function removeFile($: EngineInterface, path: string): Promise<void> {
   if (await $.fs.exists(path)) throw new Error(ran.stderr.trim().split('\n')[0] || `exit ${ran.exitCode}`)
 }
 
+// Git in the repo's top; with `index`, on that index instead of the repo's own.
+async function gitOut($: EngineInterface, top: string, args: readonly string[], index?: string): Promise<string> {
+  const init = { cwd: top, timeoutMs: GIT_TIMEOUT_MS }
+  const ran = await $.process.run(gitArgv(args), index === undefined ? init : { ...init, env: { GIT_INDEX_FILE: index } })
+  if (ran.exitCode !== 0) throw new Error(ran.stderr.trim().split('\n')[0] || `git ${args[0]} exited ${ran.exitCode}`)
+  if (ran.isStdoutTruncated) throw new Error(`git ${args[0]} said more than its output carries`)
+  return ran.stdout
+}
+
+// Where this session's snapshots go: an index of its own in the repo's git directory (beside git's, never in the
+// work tree); 'off' with no repo, or once they proved too slow.
+type Snaps = { top: string; index: string } | 'off'
+type Snap = { top: string; tree: string }
+
+let snaps: Snaps | null = null
+let snapsTaken = 0
+
+async function snapsOf($: EngineInterface): Promise<Snaps> {
+  if (snaps !== null) return snaps
+  const top = await topOf($)
+  let dir = (await gitOut($, top, ['rev-parse', '--absolute-git-dir']).catch(() => '')).trim()
+  if (dir === '') {
+    snaps = 'off'
+    return snaps
+  }
+  // An MSYS git spells D:\x as /d/x.
+  const msys = /^\/([A-Za-z])\/(.*)$/.exec(dir)
+  if (msys !== null && /^[A-Za-z]:/.test(top)) dir = `${msys[1]}:/${msys[2]}`
+  const now = await $.clock.now()
+  $.clock.after(0, () => void pruneIndexes($, dir, now))
+  snaps = { top, index: `${dir}/convo-diff-${Math.random().toString(36).slice(2, 10)}.index` }
+  return snaps
+}
+
+async function pruneIndexes($: EngineInterface, dir: string, now: number): Promise<void> {
+  try {
+    for (const entry of await $.fs.list(dir)) {
+      if (entry.kind !== 'file' || !isLeftover(entry.name, entry.mtimeMs, now)) continue
+      await removeFile($, `${dir}/${entry.name}`)
+    }
+  } catch (error) {
+    $.ui.log(`pruning old indexes failed: ${reasonOf(error)}`, { to: 'debug' })
+  }
+}
+
+// The work tree as git sees it, ignored files left out, hashed into this session's index: the tree's id, or null
+// where none is taken. Kept between snapshots, the index lets git hash only what changed since the last one; a
+// failed snapshot sends the next to a fresh index, in case a killed git left its lock on this one.
+async function snap($: EngineInterface): Promise<Snap | null> {
+  const where = await snapsOf($)
+  if (where === 'off') return null
+  const started = await $.clock.now()
+  let tree: string
+  try {
+    await gitOut($, where.top, ['add', '-A'], where.index)
+    tree = (await gitOut($, where.top, ['write-tree'], where.index)).trim()
+    if (!/^[0-9a-f]{40,64}$/.test(tree)) throw new Error(`git write-tree said ${tree.slice(0, 80)}`)
+  } catch (error) {
+    snaps = null
+    snapsTaken = 0
+    throw error
+  }
+  const took = (await $.clock.now()) - started
+  snapsTaken += 1
+  if (snapsTaken > 1 && took > SNAP_SLOW_MS) {
+    snaps = 'off'
+    $.ui.toast(`這個 repo 太大，拍一次快照要 ${(took / 1000).toFixed(1)} 秒，這個 session 先不追蹤 PowerShell 改的檔案`)
+  }
+  return { top: where.top, tree }
+}
+
+// The files a command changed between two snapshots. A file's first touch takes its base from the snapshot before:
+// git's blob, with the line endings the file has now.
+async function trackSnapshots($: EngineInterface, before: Snap, after: Snap): Promise<void> {
+  if (after.tree === before.tree) return
+  const raw = await gitOut($, before.top, ['diff-tree', '-r', '-z', '--raw', '--no-renames', before.tree, after.tree])
+  const track = await ensure($)
+  const top = await topOf($)
+  let grown = track
+  let bases = 0
+  for (const file of parseRaw(raw)) {
+    const path = `${before.top.replace(/[\\/]+$/, '')}/${file.rel}`
+    if (relOf(path, top) === null || isTracked(grown, path)) continue
+    if (file.before === null) {
+      grown = withBase(grown, top, path, { base: null, isLost: false })
+      continue
+    }
+    bases += 1
+    // A blob too large to come back whole is a base lost, as is anything past the first hundred.
+    const text =
+      bases > SNAP_MAX_BASES ? null : await gitOut($, before.top, ['cat-file', 'blob', file.before]).catch(() => null)
+    const seen = text === null ? null : await look($, path)
+    const base = text === null ? null : seen?.kind === 'text' ? withEol(text, seen.text) : text
+    grown = withBase(grown, top, path, { base, isLost: base === null })
+  }
+  await keep($, track, grown)
+}
+
+// With the keys: on the desktop a pane without them spends a first click on taking them.
+function openPane($: EngineInterface): Promise<UiOpenResult> {
+  return $.ui.open({ id: PANE, title: TITLE, rows: 30, focus: true })
+}
+
 // The model keeps its own picture of the files: a note in the conversation tells it what changed beneath it.
 async function tellModel($: EngineInterface, text: string): Promise<void> {
   try {
@@ -641,7 +753,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'diff',
       description:
-        "The net unified diff of every file in this repo that this conversation changed (Edit, Write, NotebookEdit, and Bash edits the engine tracked), each file compared with its content before this conversation first changed it. Changes made outside this conversation to files it never touched are left out. Use it to review, summarize or commit only this conversation's changes.",
+        "The net unified diff of every file in this repo that this conversation changed (Edit, Write, NotebookEdit, Bash edits the engine tracked, and PowerShell commands, from git snapshots of the work tree around each), each file compared with its content before this conversation first changed it. Changes made outside this conversation to files it never touched are left out. Use it to review, summarize or commit only this conversation's changes.",
       inputSchema: {
         type: 'object',
         properties: { path: { type: 'string', description: 'Only files whose path contains this text.' } },
@@ -719,11 +831,11 @@ export const register: Register = on => {
     return ran
   })
 
-  on('tool.call', { tool: ['Bash', 'PowerShell'] }, async ($, e, next) => {
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const ran = await next(e)
     if (ran.deny !== undefined || ran.isError === true || ran.isReadOnly === true) return ran
 
-    const edits = e.tool === 'Bash' ? bashEditsOf(ran.result) : { files: [], more: [] }
+    const edits = bashEditsOf(ran.result)
     if (edits.files.length > 0 || edits.more.length > 0) {
       await serial(async () => {
         const track = await ensure($)
@@ -747,9 +859,30 @@ export const register: Register = on => {
           grown = withBase(grown, top, path, { base: null, isLost: true })
         }
         await keep($, track, grown)
-      }).catch(error => $.ui.log(`tracking a ${e.tool} command failed: ${reasonOf(error)}`, { to: 'debug' }))
+      }).catch(error => $.ui.log(`tracking a Bash command failed: ${reasonOf(error)}`, { to: 'debug' }))
     }
     // A command may also have changed files this conversation already follows (a formatter, a revert).
+    schedule($, 'all')
+
+    return ran
+  })
+
+  // PowerShell's record names no files: snapshots of the work tree before and after the command tell which changed.
+  on('tool.call', { tool: 'PowerShell' }, async ($, e, next) => {
+    const before = await serial(() => snap($)).catch(error => {
+      $.ui.log(`snapshot before a PowerShell command failed: ${reasonOf(error)}`, { to: 'debug' })
+      return null
+    })
+    const ran = await next(e)
+    // Refused, or read-only as the engine judged it. One that failed may still have changed files.
+    if (ran.deny !== undefined || ran.isReadOnly === true) return ran
+
+    if (before !== null) {
+      await serial(async () => {
+        const after = await snap($)
+        if (after !== null) await trackSnapshots($, before, after)
+      }).catch(error => $.ui.log(`tracking a PowerShell command failed: ${reasonOf(error)}`, { to: 'debug' }))
+    }
     schedule($, 'all')
 
     return ran
@@ -773,7 +906,7 @@ export const register: Register = on => {
     })
     const view = await read($, viewAtom)
     const { changed, added, removed } = totals(view?.files ?? [])
-    const opened = await $.ui.open({ id: PANE, title: TITLE, rows: 30, focus: true })
+    const opened = await openPane($)
     const head = changed === 0 ? '這個對話還沒有改任何檔案' : `這個對話改了 ${changed} 個檔案（+${added} -${removed}）`
 
     return { text: opened.isPlaced ? `${head}，diff 在面板裡。` : `${head}；面板還沒顯示：${opened.reason}` }
@@ -892,5 +1025,40 @@ export const register: Register = on => {
         {files.length > MAX_FILES_DRAWN && <Text dimColor>{`… 還有 ${files.length - MAX_FILES_DRAWN} 個檔案沒列出來`}</Text>}
       </Box>
     )
+  })
+
+  // On the desktop, a button above the prompt opens the pane, so there is no /convo-diff to type. What other plugins
+  // draw in the band stays, above it.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const beneath = await next(e)
+    if (e.surface !== 'desktop' || e.props.hasSurvey) return beneath
+    const view = await read($, viewAtom)
+    const { changed, added, removed } = totals(view?.files ?? [])
+    if (changed === 0) return beneath
+
+    const { Box, Button, Text } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="column">
+        {beneath}
+        <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+          <Button key={OPEN} label={TITLE} onPress={() => void openPane($)} />
+          <Text dimColor>{`這個對話改了 ${changed} 個檔案`}</Text>
+          {added > 0 && <Text color="success">{`+${added}`}</Text>}
+          {removed > 0 && <Text color="error">{`-${removed}`}</Text>}
+        </Box>
+      </Box>
+    )
+  })
+
+  // While the prompt holds the keys, a click on the desktop band only moves its focus ring onto the button, and the
+  // press waits for a second click. Opening the pane harms nothing, so the ring landing there by the person's hand
+  // opens it too; a Tab onto it does the same, since the two cannot be told apart.
+  on('ui.focus', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const result = await next(e)
+    if (result.deny === undefined && e.plugin === PLUGIN && e.element === OPEN && e.origin.kind === 'person') {
+      $.clock.after(0, () => void openPane($).catch(() => undefined))
+    }
+
+    return result
   })
 }
