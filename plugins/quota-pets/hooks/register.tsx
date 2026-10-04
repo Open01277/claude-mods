@@ -10,6 +10,8 @@ import type {
   QuotaPetsPreview,
   QuotaPetsScene,
 } from '../types'
+import { biggest, categoryName, mealsOf } from './meals'
+import type { Meal } from './meals'
 
 type Rarity = 'N' | 'R' | 'SR' | 'SSR' | 'UR'
 type Kind = 'cat' | 'dog'
@@ -69,6 +71,8 @@ type Species = {
   bellyLines: readonly [readonly string[], readonly string[]]
   burpLines: readonly string[]
   slimLines: readonly string[]
+  // What it says of the biggest thing in its belly: {meal}, and its size {k}.
+  mealLines: readonly string[]
 }
 
 // Kept in $.store so the collection and pity outlive the session. Each conversation's pet is its own key.
@@ -101,6 +105,8 @@ const BACK_FOR = 10 * MINUTE
 const SLIM_FOR = 10 * MINUTE
 // Past midnight and before five, the pet is sleepy.
 const NIGHT_ENDS = 5
+// How many of the belly's biggest meals /petdex 肚子 lists.
+const MEALS_SHOWN = 5
 
 const whiskers = (face: string) => `(=${face}=)`
 const floppy = (face: string) => `U${face}U`
@@ -149,6 +155,7 @@ const SPECIES: Readonly<Record<Kind, Species>> = {
     ],
     burpLines: ['（吐了一顆毛球）…舒服多了喵', '剛剛吐掉的…是前面的對話嗎？有點想不起來了'],
     slimLines: ['減肥成功！身輕如燕喵', '瘦下來了，又可以吃了喵'],
+    mealLines: ['最大的一口是 {meal}（≈{k}），好撐喵', '都是 {meal}（≈{k}）害的…我才這麼撐喵'],
   },
   dog: {
     label: '狗',
@@ -192,6 +199,7 @@ const SPECIES: Readonly<Record<Kind, Species>> = {
     ],
     burpLines: ['（吐完）…汪，肚子空空的好舒服', '前面聊了什麼…我好像忘了汪'],
     slimLines: ['減肥成功！可以再跑十圈汪', '瘦下來了！（原地轉圈）'],
+    mealLines: ['（打嗝）最大的一口是 {meal}（≈{k}）', '{meal}（≈{k}）好大一塊…整塊吞下去了汪'],
   },
 }
 
@@ -886,9 +894,15 @@ function asideLine(pet: Pet, aside: Aside, seed: number): string {
   return own ?? pick(isBursting ? species.bellyLines[1] : species.bellyLines[0], pet.id, seed)
 }
 
-function bellyToast(pet: Pet, pct: number | null, hasThreshold: boolean): string {
+function bellyToast(pet: Pet, pct: number | null, hasThreshold: boolean, top: Meal | null): string {
   const tail = hasThreshold ? '再吃就要吐了（快要自動壓縮了）' : '可以 /compact 幫牠消化一下'
-  return `${portrait(pet)} 肚子快撐爆了（context ${pct ?? '?'}%）…${tail}`
+  const meal = top === null ? '' : `｜最大的一口：${top.label}（≈${tokensText(top.tokens)}），/petdex 肚子 看全部`
+  return `${portrait(pet)} 肚子快撐爆了（context ${pct ?? '?'}%）…${tail}${meal}`
+}
+
+function mealLine(pet: Pet, meal: Meal): string {
+  const line = pick(SPECIES[pet.kind].mealLines, pet.id, meal.label)
+  return line.replace('{meal}', meal.label).replace('{k}', tokensText(meal.tokens))
 }
 
 function slimToast(pet: Pet, compacted: QuotaPetsCompaction): string {
@@ -1145,7 +1159,10 @@ async function digest($: EngineInterface, context: SessionContextUsage): Promise
   const stage = bellyStage(fillOf(belly))
   if (stage === 3 && !belly.warned) {
     const pet = await petNow($)
-    if (pet !== null) $.ui.toast(bellyToast(pet, pct, belly.threshold !== null), { timeoutMs: 10_000 })
+    if (pet !== null) {
+      const top = biggest((await mealsNow($)) ?? [], 1)[0] ?? null
+      $.ui.toast(bellyToast(pet, pct, belly.threshold !== null, top), { timeoutMs: 10_000 })
+    }
     belly = { ...belly, warned: true }
   } else if (stage < 2 && belly.warned) {
     belly = { ...belly, warned: false }
@@ -1219,6 +1236,62 @@ async function tick($: EngineInterface, isBusy: boolean): Promise<void> {
   await update($, activityAtom, value => (value === null ? null : { ...value, nags: value.nags + 1 }))
 }
 
+// The meals in this conversation's belly, biggest first: the conversation as the next request sends it, so a
+// compaction's summary stands in for what it replaced. Null when the conversation cannot be read.
+async function mealsNow($: EngineInterface): Promise<Meal[] | null> {
+  try {
+    const messages = await $.session.messages({ as: 'api' })
+    const root = await $.session.root().catch(() => '')
+    return mealsOf(messages, root)
+  } catch {
+    return null
+  }
+}
+
+// /petdex 肚子: how full the belly is, its biggest meals, and what else the context holds.
+async function bellyText($: EngineInterface): Promise<string> {
+  const pet = await petNow($)
+  const usage = await $.session.usage({ breakdown: 'summary' }).catch(() => null)
+  const meals = await mealsNow($)
+  const context = usage?.context
+  const breakdown = context?.breakdown
+  const threshold = breakdown?.isAutoCompactEnabled === true ? (breakdown.autoCompactThreshold ?? null) : null
+  const tokens = context?.tokens ?? null
+  const window = context?.window ?? 0
+  const fill = tokens === null || window <= 0 ? null : tokens / (threshold ?? window)
+  const who = pet === null ? '肚子' : `${portrait(pet)} ${pet.name}的肚子`
+
+  let head = `${who}：還沒有回覆報過 context，下一輪就知道有多撐`
+  if (tokens !== null && fill !== null) {
+    const pct = context?.percent ?? Math.round((tokens / window) * 100)
+    const limit = threshold === null ? '自動壓縮關著，吃到滿為止' : `吃到 ≈${tokensText(threshold)} 會吐（自動壓縮）`
+    head = `${who} ${gauge(fill)} context ${pct}%（≈${tokensText(tokens)} / ${tokensText(window)}，${limit}）`
+  }
+
+  const lines = [head, '']
+  const top = biggest(meals ?? [], MEALS_SHOWN)
+  if (meals === null) lines.push('讀不到這個對話的內容')
+  else if (top.length === 0) lines.push('肚子裡還沒有什麼大餐')
+  else {
+    lines.push(`吃最多的前 ${top.length} 名：`)
+    top.forEach((meal, index) => {
+      const times = meal.count > 1 ? ` ×${meal.count}` : ''
+      lines.push(` ${index + 1}. ${`≈${tokensText(meal.tokens)}`.padEnd(6)} ${meal.label}${times}`)
+    })
+  }
+  const rows = (breakdown?.categories ?? []).filter(row => row.kind === 'used' && row.tokens > 0)
+  if (rows.length > 0) {
+    lines.push('', `肚子裡的分類：${rows.map(row => `${categoryName(row.name)} ≈${tokensText(row.tokens)}`).join('｜')}`)
+  }
+  const first = top[0]
+  if (pet !== null && first !== undefined) {
+    const advice = bellyStage(fill) >= 2 ? '…要不要 /compact 幫我消化一下？' : ''
+    lines.push('', `「${mealLine(pet, first)}${advice}」`)
+  }
+  lines.push('', '（token 數是估計的。太撐可以 /compact，或請 Claude 別整個讀大檔案）')
+  return lines.join('\n')
+}
+
 async function dexText($: EngineInterface): Promise<string> {
   const save = await serial(() => load($))
   const life = await read($, lifeAtom)
@@ -1257,9 +1330,9 @@ async function dexText($: EngineInterface): Promise<string> {
     '最近：',
     ...save.history.map(line => `・${line}`),
     '',
-    '玩法：/petdex 試抽 ｜ /petdex 十連 ｜ /petdex 預覽 ｜ /petdex 預覽 95 柴犬',
+    '玩法：/petdex 試抽 ｜ /petdex 十連 ｜ /petdex 肚子 ｜ /petdex 預覽 ｜ /petdex 預覽 95 柴犬',
     '　　　/petdex 預覽 深夜｜散步｜回來｜肚子 85｜吐｜減肥（可以接名字）',
-    '肚子是 context：快自動壓縮時會撐、壓縮完會吐（/compact 是減肥）。連續寫 50 分鐘會吵著散步，半夜會催你睡。',
+    '肚子是 context：快自動壓縮時會撐、壓縮完會吐（/compact 是減肥），/petdex 肚子 看牠吃了什麼。連續寫 50 分鐘會吵著散步，半夜會催你睡。',
   ].join('\n')
 }
 
@@ -1309,7 +1382,8 @@ async function sceneToast($: EngineInterface, pet: Pet, preview: QuotaPetsPrevie
   if (scene !== 'belly') return null
   const held = await read($, bellyAtom)
   const belly = bellyOf(held, held?.conv ?? 0, preview, now)
-  return bellyStage(belly.fill) === 3 ? bellyToast(pet, belly.pct, held !== null && held.threshold !== null) : null
+  const meal: Meal = { label: 'Read package-lock.json', tokens: 45_000, count: 1 }
+  return bellyStage(belly.fill) === 3 ? bellyToast(pet, belly.pct, held !== null && held.threshold !== null, meal) : null
 }
 
 async function startPreview($: EngineInterface, words: readonly string[]): Promise<string> {
@@ -1375,8 +1449,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'petdex',
-      description: '額度寵物圖鑑：抽過的貓狗、陣亡紀錄、保底（試抽／十連／預覽）',
-      argumentHint: '[試抽 | 十連 | 預覽 [0-100 | 深夜 | 散步 | 肚子 0-100 | 吐 | 減肥] [名字]]',
+      description: '額度寵物圖鑑：抽過的貓狗、陣亡紀錄、保底（試抽／十連／肚子／預覽）',
+      argumentHint: '[試抽 | 十連 | 肚子 | 預覽 [0-100 | 深夜 | 散步 | 肚子 0-100 | 吐 | 減肥] [名字]]',
     })
     const usage = await $.session.usage()
     await serial(() => ingest($, usage.rateLimits))
@@ -1461,6 +1535,7 @@ export const register: Register = on => {
     const [verb, ...rest] = words
     if (verb === '試抽' || verb === 'try') return { text: trialText(1) }
     if (verb === '十連' || verb === '10') return { text: trialText(10) }
+    if (verb === '肚子' || verb === 'belly') return { text: await bellyText($) }
     if (verb === '預覽' || verb === 'preview') return { text: await startPreview($, rest) }
 
     return { text: await dexText($) }
@@ -1469,6 +1544,8 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const held = await read($, lifeAtom)
     if (e.props.hasSurvey || held === null) return next(e)
+    // What other plugins draw in the band (convo-diff's button) stays, under the pet.
+    const beneath = await next(e)
 
     const limits = await read($, limitsAtom)
     const preview = await read($, previewAtom)
@@ -1569,6 +1646,7 @@ export const register: Register = on => {
             {shown !== null && <Text color="magenta">（預覽中）</Text>}
           </Box>
         )}
+        {beneath}
       </Box>
     )
   })

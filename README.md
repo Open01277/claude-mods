@@ -4,6 +4,7 @@
 
 - **quota-pets**：額度寵物扭蛋，每個對話抽一隻顏文字貓或狗陪你看額度
   - context 是寵物的肚子：快自動壓縮時會撐、壓縮完會吐，`/compact` 是減肥
+  - `/petdex 肚子` 看牠吃了什麼：context 裡最大的前五口（讀了哪個大檔案、哪個指令輸出特別長），快撐爆時的提醒也會說最大的一口是什麼
   - 連續寫 50 分鐘會吵著要散步，提醒你休息；半夜會打呵欠催你去睡
   - `/petdex 預覽 深夜`（或 `散步`、`肚子 85`、`吐`、`減肥`）可以先看看長什麼樣子
 - **convo-diff**：`/convo-diff` 打開面板，只列出這個對話在 repo 裡改過的檔案 diff（每個檔案跟它在這個對話第一次被改之前的內容比），不會混進別的對話或手動的修改
@@ -32,7 +33,11 @@ claude plugin install convo-diff@claude-mods
 
 ```bash
 claude plugin marketplace update claude-mods
+claude plugin update quota-pets@claude-mods
+claude plugin update convo-diff@claude-mods
 ```
+
+更新完要重開 Claude Code 才會載入新版。
 
 ## 新增一個 mod
 

@@ -55,6 +55,12 @@ function world(on: On, rateLimits: SessionRateLimit[]) {
     context: { window: 200_000 } as Context,
     // Where auto-compaction runs, as the breakdown reports it; undefined while it is off.
     threshold: 160_000 as number | undefined,
+    // The context by category, as /context breaks it down.
+    categories: [] as { name: string; tokens: number; kind: string }[],
+    // The conversation as the next request sends it.
+    messages: [] as unknown[],
+    // What another plugin draws in the band, beneath this one.
+    beneath: null as string | null,
     shown: [] as string[],
   }
   on('session.start', ($, e) => ({ cwd: (e as { cwd: string }).cwd }) as never)
@@ -64,15 +70,26 @@ function world(on: On, rateLimits: SessionRateLimit[]) {
   on('turn.complete', () => ({ text: '' }) as never)
   on('command.register', ($, e) => ({ value: { command: (e as { name: string }).name } }) as never)
   on('ui.invalidate', () => ({ value: undefined }) as never)
+  on('session.messages', () => ({ value: state.messages }) as never)
+  on('session.root', () => ({ value: 'D:\\proj' }) as never)
   on('session.usage', ($, e) => {
     const isBroken = (e as { breakdown?: string }).breakdown !== undefined
-    const breakdown = { isAutoCompactEnabled: state.threshold !== undefined, autoCompactThreshold: state.threshold }
+    const breakdown = {
+      isAutoCompactEnabled: state.threshold !== undefined,
+      autoCompactThreshold: state.threshold,
+      categories: state.categories,
+    }
     const context = isBroken ? { ...state.context, breakdown } : state.context
     return { value: { startedAt: state.startedAt, context, rateLimits: state.rateLimits } } as never
   })
   on('ui.toast', ($, e) => {
     state.shown.push((e as { text: string }).text)
     return { value: undefined } as never
+  })
+  // The engine draws nothing of its own in the band; another plugin may.
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    return state.beneath === null ? <Box /> : <Text>{state.beneath}</Text>
   })
   on('ui.log', ($, e) => {
     state.shown.push(`log: ${(e as { text: string }).text}`)
@@ -446,4 +463,84 @@ test('every pet acts out every scene', { timeoutMs: 60_000 }, async ($, on) => {
   const previews = w.shown.filter(text => text.startsWith('【預覽】'))
   expect(previews.length).toBe((CATS.length + DOGS.length) * 5)
   console.log(previews.slice(0, 10).join('\n'))
+})
+
+// A conversation as the next request sends it: a big file read twice, a file written whole, a long log, a screenshot.
+const MEALS = [
+  { role: 'user', content: [{ type: 'text', text: '<system-reminder>\nCLAUDE.md\n</system-reminder>' }, { type: 'text', text: '幫我看 build 為什麼壞掉' }] },
+  { role: 'assistant', content: [{ type: 'tool_use', id: 'r1', name: 'Read', input: { file_path: 'D:\\proj\\package-lock.json' } }] },
+  { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'r1', content: 'x'.repeat(140_000) }] },
+  { role: 'assistant', content: [{ type: 'tool_use', id: 'w1', name: 'Write', input: { file_path: 'D:\\proj\\src\\app.ts', content: 'y'.repeat(35_000) } }] },
+  { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'w1', content: 'File created successfully' }] },
+  { role: 'assistant', content: [{ type: 'tool_use', id: 'p1', name: 'PowerShell', input: { command: 'git log -p -5' } }] },
+  { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'p1', content: [{ type: 'text', text: 'z'.repeat(21_000) }] }] },
+  { role: 'assistant', content: [{ type: 'tool_use', id: 'r2', name: 'Read', input: { file_path: 'D:\\proj\\package-lock.json', offset: 9 } }] },
+  { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'r2', content: 'x'.repeat(14_000) }] },
+  { role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } }] },
+]
+
+test("/petdex 肚子 lists the biggest meals in the belly, and the pet blames the biggest when it is about to burst", { timeoutMs: 20_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, limits(10, 20))
+  w.messages = MEALS
+  w.categories = [
+    { name: 'System prompt', tokens: 3100, kind: 'used' },
+    { name: 'System tools', tokens: 17_000, kind: 'used' },
+    { name: 'Messages', tokens: 62_000, kind: 'used' },
+    { name: 'Free space', tokens: 85_000, kind: 'free' },
+    { name: 'Autocompact buffer', tokens: 33_000, kind: 'buffer' },
+  ]
+  await $.session.start(START)
+  await clock.advance(1000)
+  await eat($, w, 82_000)
+
+  const said = (await $.command.run({ command: 'petdex', args: '肚子' } as never)).text
+  const lines = said.split('\n')
+  expect(lines[0]).toContain('的肚子 ●●●○○ context 41%（≈82k / 200k，吃到 ≈160k 會吐（自動壓縮））')
+  expect(said).toContain('吃最多的前 4 名：')
+  expect(lines.find(line => line.startsWith(' 1.'))).toBe(' 1. ≈44k   Read package-lock.json ×2')
+  expect(lines.find(line => line.startsWith(' 2.'))).toContain('Write src/app.ts（寫進去的內容）')
+  expect(lines.find(line => line.startsWith(' 3.'))).toContain('≈6k    PowerShell git log -p -5')
+  expect(lines.find(line => line.startsWith(' 4.'))).toContain('你貼的圖片')
+  expect(said).toContain('肚子裡的分類：系統提示 ≈3k｜內建工具 ≈17k｜對話 ≈62k')
+  expect(said).not.toContain('Free space')
+  // The pet names the biggest meal; not yet full enough to ask for a /compact.
+  expect(lineOf(said)).toContain('package-lock.json（≈44k）')
+  expect(lineOf(said)).not.toContain('/compact')
+  console.log(said)
+
+  // About to burst: the toast says what the biggest meal was.
+  await eat($, w, 150_000)
+  expect(w.shown.filter(text => text.includes('肚子快撐爆了'))).toHaveLength(1)
+  expect(w.shown.some(text => text.includes('最大的一口：Read package-lock.json（≈44k），/petdex 肚子 看全部'))).toBe(true)
+  expect(lineOf((await $.command.run({ command: 'petdex', args: 'belly' } as never)).text)).toContain('/compact')
+  console.log(w.shown.join('\n'))
+})
+
+test('/petdex 肚子 before any reply and with nothing big eaten yet', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, limits(10, 20))
+  w.messages = [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }]
+  await $.session.start(START)
+
+  const said = (await $.command.run({ command: 'petdex', args: '肚子' } as never)).text
+  expect(said).toContain('還沒有回覆報過 context')
+  expect(said).toContain('肚子裡還沒有什麼大餐')
+  expect(said).not.toContain('「')
+})
+
+test('what other plugins draw in the band stays, under the pet', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, limits(10, 20))
+  w.beneath = '對話 diff · 這個對話改了 2 個檔案 +5 -1'
+  await $.session.start(START)
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const drawn = await band($, surface)
+    expect(drawn).toContain('這個對話改了 2 個檔案')
+    expect(drawn.indexOf('5h')).toBeLessThan(drawn.indexOf('對話 diff'))
+  }
 })
