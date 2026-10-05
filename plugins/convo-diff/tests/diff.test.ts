@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { diffText, printable, unapply } from '../hooks/diff'
+import { diffText, piecesOf, printable, unapply } from '../hooks/diff'
 import type { Hunk } from '../hooks/diff'
 
 function numbered(count: number, change?: (n: number) => string | null): string {
@@ -93,6 +93,55 @@ test('a huge diff is cut into valid chunks under the limits', () => {
     total += chunk.length
   }
   expect(total).toBeLessThanOrEqual(30_000)
+})
+
+// A diff's hunks, read back from its text.
+function hunksIn(source: string): Hunk[] {
+  const hunks: Hunk[] = []
+  for (const line of source.split('\n')) {
+    const header = /^@@ -(\d+),(\d+) \+(\d+),(\d+) @@$/.exec(line)
+    if (header !== null) {
+      const [oldStart, oldLines, newStart, newLines] = header.slice(1).map(Number) as [number, number, number, number]
+      hunks.push({ oldStart, oldLines, newStart, newLines, lines: [] })
+    } else hunks.at(-1)?.lines.push(line)
+  }
+  return hunks
+}
+
+test('a long diff is cut again into short pieces, each valid on its own and together the same change', () => {
+  const before = numbered(200, n => (n % 3 === 0 ? `line ${n}` : `old ${n}`))
+  const after = numbered(200, n => (n % 3 === 0 ? `line ${n}` : n % 7 === 0 ? null : `new ${n}`)).replace(/^line \d+\n/m, '')
+  const diff = diffText(before, after)
+  const pieces = piecesOf(diff.chunks, 20)
+  expect(pieces.length).toBeGreaterThan(5)
+  for (const piece of pieces) {
+    expect(piece.split('\n').length).toBeLessThanOrEqual(20)
+    expectValidHunks(piece)
+  }
+  // Cut and counted again, the hunks still undo to the text before.
+  expect(unapply(after, pieces.flatMap(hunksIn))).toBe(before)
+
+  // All added, or all removed, cut mid-hunk: each piece starts where the one before ended, on both sides, a side
+  // with no lines named by the line before it as git does.
+  for (const diff of [diffText('a\nb\n', `${numbered(30)}a\nb\n`), diffText(numbered(30), '')]) {
+    const cut = piecesOf(diff.chunks, 8)
+    expect(cut.length).toBeGreaterThan(3)
+    for (const piece of cut) expectValidHunks(piece)
+    const lines = (hunks: Hunk[]) => hunks.flatMap(hunk => hunk.lines)
+    expect(lines(cut.flatMap(hunksIn))).toEqual(lines(diff.chunks.flatMap(hunksIn)))
+    let oldNext = 1
+    let newNext = 1
+    for (const hunk of cut.flatMap(hunksIn)) {
+      expect(hunk.oldLines === 0 ? hunk.oldStart + 1 : hunk.oldStart).toBe(oldNext)
+      expect(hunk.newLines === 0 ? hunk.newStart + 1 : hunk.newStart).toBe(newNext)
+      oldNext += hunk.oldLines
+      newNext += hunk.newLines
+    }
+  }
+
+  // Short enough already: as it was.
+  const short = diffText('a\n', 'b\n')
+  expect(piecesOf(short.chunks, 20)).toEqual(short.chunks)
 })
 
 test('control characters are drawn as their pictures', () => {

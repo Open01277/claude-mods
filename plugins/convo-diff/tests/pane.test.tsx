@@ -685,13 +685,22 @@ test('PowerShell commands are followed through git snapshots of the work tree', 
   expect([...git.indexes]).toHaveLength(1)
   expect([...git.indexes][0]).toMatch(/^D:\/proj\/\.git\/convo-diff-[0-9a-z]+\.index$/)
 
-  // A read-only command follows nothing, even when a file changes meanwhile (the person typing in an editor).
+  // A read-only command follows nothing, even when a file changes meanwhile (the person typing in an editor), and
+  // takes no snapshot: the one after the last command serves the next.
   const before = git.calls.length
   w.shell = () => w.files.set(spelled(E), 'typed by the person\n')
   await $.tool.call({ tool: 'PowerShell', command: 'Get-ChildItem' } as never)
   await clock.advance(1000)
   expect(await drawn($)).not.toContain('e.txt')
-  expect(git.calls.slice(before).filter(args => args[0] === 'add')).toHaveLength(1)
+  expect(git.calls.slice(before).filter(args => args[0] === 'add')).toHaveLength(0)
+  // What the person typed shows in the snapshot the next turn starts with, so no command takes it for its own.
+  await $.turn.start({ text: 'go on', turnId: 't1' } as never)
+  w.shell = () => w.files.set(spelled(A), 'one\nTWO\nthree\nfour\n')
+  await $.tool.call({ tool: 'PowerShell', command: "Add-Content a.txt 'four'" } as never)
+  await clock.advance(1000)
+  expect(await drawn($)).not.toContain('e.txt')
+  // One snapshot a command: none before it.
+  expect(git.calls.slice(before).filter(args => args[0] === 'add')).toHaveLength(2)
 
   // A revert puts back the text the snapshot saw, with the CRLF the file has: git stored it with LF.
   const ui = await mountPane($)
@@ -715,6 +724,109 @@ test('with no git repo, PowerShell commands still run and follow nothing', async
   await clock.advance(1000)
   expect(await drawn($)).toContain('這個對話還沒有改任何檔案')
   expect(w.files.get(spelled(A))).toBe('uno\n')
+})
+
+test("files a Bash command's record names without their changes are compared with the turn's snapshot", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const C = 'D:\\proj\\c.txt'
+  const D = 'D:\\proj\\d.txt'
+  const w = world(on, { [A]: 'one\n', [B]: 'b\n', [C]: 'c\n', [D]: 'd\n' })
+  const git = fakeGit(on, w)
+  await $.session.start(START)
+  await clock.advance(1000)
+  await $.turn.start({ text: 'add the guard to every script', turnId: 't1' } as never)
+  // The snapshot is not awaited by the turn's start: the model thinks meanwhile.
+  await clock.advance(10)
+  const adds = () => git.calls.filter(args => args[0] === 'add').length
+  expect(adds()).toBe(1)
+
+  // One script changes three files; the engine keeps the changes of the first alone, as it does past five.
+  w.files.set(spelled(A), 'uno\n')
+  w.files.set(spelled(B), 'guard\nb\n')
+  w.files.set(spelled(C), 'guard\nc\n')
+  w.bash = {
+    files: [{ filePath: A, hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-one', '+uno'] }] }],
+    moreFiles: 2,
+    changedFiles: [A, B, C],
+  }
+  await $.tool.call({ tool: 'Bash', command: 'php add_guard.php' } as never)
+  await clock.advance(1000)
+  expect(adds()).toBe(2)
+
+  // A command whose record holds no files at all is told by the snapshots too.
+  w.files.set(spelled(D), 'guard\nd\n')
+  w.bash = { files: [], moreFiles: 0, unavailable: true }
+  await $.tool.call({ tool: 'Bash', command: 'php add_guard.php d.txt' } as never)
+  await clock.advance(1000)
+  expect(adds()).toBe(3)
+
+  // A record with every change in it takes no snapshot.
+  w.files.set(spelled(A), 'eins\n')
+  w.bash = { files: [{ filePath: A, hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-uno', '+eins'] }] }], moreFiles: 0 }
+  await $.tool.call({ tool: 'Bash', command: "sed -i 's/uno/eins/' a.txt" } as never)
+  await clock.advance(1000)
+  expect(adds()).toBe(3)
+
+  for (const surface of SURFACES) {
+    const text = await drawn($, surface)
+    expect(text).toContain('這個對話改了 4 個檔案')
+    expect(text).toContain('-one')
+    expect(text).toContain('+eins')
+    for (const name of ['b.txt', 'c.txt', 'd.txt']) expect(text).toContain(name)
+    expect(text).toContain('+guard')
+    expect(text).not.toContain('無法比對')
+  }
+})
+
+test('with no git repo, files a Bash record names without their changes cannot be compared', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, { [A]: 'one\n', [B]: 'b\n' })
+  on('process.run', () => ({ value: { ...RAN, exitCode: 128, stderr: 'fatal: not a git repository' } }) as never)
+  await $.session.start(START)
+  await clock.advance(1000)
+  await $.turn.start({ text: 'go', turnId: 't1' } as never)
+
+  w.files.set(spelled(A), 'uno\n')
+  w.files.set(spelled(B), 'bee\n')
+  w.bash = {
+    files: [{ filePath: A, hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-one', '+uno'] }] }],
+    moreFiles: 1,
+    changedFiles: [A, B],
+  }
+  await $.tool.call({ tool: 'Bash', command: 'php both.php' } as never)
+  await clock.advance(1000)
+
+  const text = await drawn($)
+  expect(text).toContain('+uno')
+  expect(text).toContain('b.txt')
+  expect(text).toContain('無法比對')
+})
+
+test("a long diff names its file again further down, so a scrolled pane still says whose it is", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const lines = (word: string) => Array.from({ length: 60 }, (_, at) => `${word} ${at}`).join('\n') + '\n'
+  world(on, { [A]: lines('old'), [B]: 'b\n' })
+  await $.session.start(START)
+  await clock.advance(1000)
+  await $.tool.call({ tool: 'Write', file_path: A, content: lines('new') } as never)
+  await edit($, B, 'b', 'bee')
+  await clock.advance(1000)
+
+  for (const surface of SURFACES) {
+    const ui = await mountPane($, surface)
+    const codes = await ui.findAll({ type: 'Code' })
+    const text = textOf(await ui.drawn())
+    await ui.unmount()
+    // 121 rows of a.txt, in pieces of 34 (the pane's 40 rows less a margin): three more names; b.txt's is short.
+    expect(text.split('a.txt（續）')).toHaveLength(4)
+    expect(text).not.toContain('b.txt（續）')
+    expect(codes).toHaveLength(5)
+    expect(text).toContain('-old 59')
+    expect(text).toContain('+new 59')
+  }
 })
 
 const BAND_PROPS = { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 100 } as const

@@ -289,6 +289,64 @@ export function diffText(before: string | null, after: string | null, limits: Di
   return { added, removed, chunks, hiddenLines }
 }
 
+const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/
+
+// One diff line, with the line number it starts at on each side.
+type Row = { text: string; old: number; new: number }
+
+// A run of a hunk's rows as a hunk of its own: a header counted from them.
+function hunkOf(rows: readonly Row[]): string {
+  const first = rows[0] as Row
+  const oldCount = rows.filter(row => !row.text.startsWith('+')).length
+  const newCount = rows.filter(row => !row.text.startsWith('-')).length
+  const os = oldCount === 0 ? first.old - 1 : first.old
+  const ns = newCount === 0 ? first.new - 1 : first.new
+  return `@@ -${os},${oldCount} +${ns},${newCount} @@\n${rows.map(row => row.text).join('\n')}`
+}
+
+// A file's chunks cut again into pieces of at most `rows` lines and `chars` characters, headers counted, each a
+// valid diff on its own: a hunk cut in two is two hunks.
+export function piecesOf(chunks: readonly string[], rows: number, chars: number = LIMITS.chunk): string[] {
+  const pieces: string[] = []
+  let parts: string[] = []
+  let run: Row[] = []
+  let used = 0
+  let size = 0
+  let oldNext = 1
+  let newNext = 1
+  const closeRun = () => {
+    if (run.length > 0) parts.push(hunkOf(run))
+    run = []
+  }
+  const closePiece = () => {
+    closeRun()
+    if (parts.length > 0) pieces.push(parts.join('\n'))
+    parts = []
+    used = 0
+    size = 0
+  }
+  for (const line of chunks.flatMap(chunk => chunk.split('\n'))) {
+    const header = HUNK_HEADER.exec(line)
+    if (header !== null) {
+      closeRun()
+      oldNext = Number(header[1]) + (header[2] === '0' ? 1 : 0)
+      newNext = Number(header[3]) + (header[4] === '0' ? 1 : 0)
+      continue
+    }
+    // Room for this line, and for the header its run needs when it opens one.
+    const cost = (run.length === 0 ? 1 : 0) + 1
+    if (used > 0 && (used + cost > rows || size + line.length + 40 > chars)) closePiece()
+    if (run.length === 0) used += 1
+    run.push({ text: line, old: oldNext, new: newNext })
+    used += 1
+    size += line.length + 1
+    if (!line.startsWith('+')) oldNext++
+    if (!line.startsWith('-')) newNext++
+  }
+  closePiece()
+  return pieces
+}
+
 // The text before a change, from the text after it and the change's hunks; null when they disagree.
 export function unapply(after: string, hunks: readonly Hunk[]): string | null {
   const eol = after.includes('\r\n') ? '\r\n' : '\n'

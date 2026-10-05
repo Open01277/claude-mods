@@ -10,7 +10,7 @@ import type {
   ConvoDiffUndo,
   ConvoDiffView,
 } from '../types'
-import { diffText, isBinary, unapply } from './diff'
+import { diffText, isBinary, piecesOf, unapply } from './diff'
 import type { Hunk } from './diff'
 import { gitArgv, isLeftover, parseRaw, parseTree, sameText, withEol } from './git'
 
@@ -192,10 +192,13 @@ function isHunk(value: unknown): value is Hunk {
   )
 }
 
-// The working-tree changes the engine saw a Bash command make (an internal field: read with care).
-function bashEditsOf(result: unknown): { files: BashEdit[]; more: string[] } {
+// The working-tree changes the engine saw a Bash command make (an internal field: read with care). `isPartial`: it
+// changed files the record names without their changes (`more`), or names none of (unavailable, skipped). No record
+// at all is a command that changed nothing.
+function bashEditsOf(result: unknown): { files: BashEdit[]; more: string[]; isPartial: boolean } {
   const diff = record(record(result)?.bashEditDiff)
-  if (diff === null || diff.unavailable === true || diff.skipped === true) return { files: [], more: [] }
+  if (diff === null) return { files: [], more: [], isPartial: false }
+  if (diff.unavailable === true || diff.skipped === true) return { files: [], more: [], isPartial: true }
   const files: BashEdit[] = []
   for (const one of Array.isArray(diff.files) ? diff.files : []) {
     const r = record(one)
@@ -206,7 +209,7 @@ function bashEditsOf(result: unknown): { files: BashEdit[]; more: string[] } {
   const shown = new Set(files.map(file => keyOf(file.path)))
   const changed = Array.isArray(diff.changedFiles) ? diff.changedFiles : []
   const more = changed.filter((path): path is string => typeof path === 'string' && !shown.has(keyOf(path)))
-  return { files, more }
+  return { files, more, isPartial: more.length > 0 || Number(diff.moreFiles) > 0 }
 }
 
 function isTracked(track: ConvoDiffTrack, path: string): boolean {
@@ -702,6 +705,10 @@ type Snap = { top: string; tree: string }
 
 let snaps: Snaps | null = null
 let snapsTaken = 0
+// The latest snapshot, taken as each turn starts and after each command that needed one. Every file this
+// conversation changed since is followed already, so one that differs from it and is not followed yet was changed
+// by the command just run: one snapshot after a command is enough, and none before it.
+let lastSnap: Snap | null = null
 
 async function snapsOf($: EngineInterface): Promise<Snaps> {
   if (snaps !== null) return snaps
@@ -752,9 +759,14 @@ async function snap($: EngineInterface): Promise<Snap | null> {
   snapsTaken += 1
   if (snapsTaken > 1 && took > SNAP_SLOW_MS) {
     snaps = 'off'
-    $.ui.toast(`這個 repo 太大，拍一次快照要 ${(took / 1000).toFixed(1)} 秒，這個 session 先不追蹤 PowerShell 改的檔案`)
+    lastSnap = null
+    $.ui.toast(
+      `這個 repo 太大，拍一次快照要 ${(took / 1000).toFixed(1)} 秒，這個 session 先不拍了：PowerShell 改的檔案不追蹤，Bash 一次改很多檔案時有些會無法比對`,
+    )
+    return { top: where.top, tree }
   }
-  return { top: where.top, tree }
+  lastSnap = { top: where.top, tree }
+  return lastSnap
 }
 
 // The files a command changed between two snapshots. A file's first touch takes its base from the snapshot before:
@@ -907,7 +919,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'diff',
       description:
-        "The net unified diff of the files in this repo that this conversation changed (Edit, Write, NotebookEdit, Bash edits the engine tracked, and PowerShell commands, from git snapshots of the work tree around each). By default only what is not committed yet: a file a commit took since this conversation first changed it is compared with that commit, any other with its content before this conversation first changed it. With scope \"all\", the whole conversation, each file against its content before this conversation first changed it, commits or not. Changes made outside this conversation to files it never touched are left out. Use it to review, summarize or commit only this conversation's changes.",
+        "The net unified diff of the files in this repo that this conversation changed (Edit, Write, NotebookEdit, Bash and PowerShell commands; what a command's own record leaves out comes from git snapshots of the work tree). By default only what is not committed yet: a file a commit took since this conversation first changed it is compared with that commit, any other with its content before this conversation first changed it. With scope \"all\", the whole conversation, each file against its content before this conversation first changed it, commits or not. Changes made outside this conversation to files it never touched are left out. Use it to review, summarize or commit only this conversation's changes.",
       inputSchema: {
         type: 'object',
         properties: {
@@ -936,6 +948,7 @@ export const register: Register = on => {
       await serial(async () => {
         cache.clear()
         lastHead = undefined
+        lastSnap = null
         await update($, trackAtom, () => null)
         await update($, viewAtom, () => null)
         await update($, revertAtom, () => null)
@@ -951,6 +964,9 @@ export const register: Register = on => {
     await serial(() => ensure($)).catch(() => undefined)
     // A commit made elsewhere (the person's own terminal) shows by the next turn.
     schedule($, 'all')
+    // What the person changed between turns is in this snapshot, so no command takes it for its own. Not awaited: the
+    // model thinks meanwhile, and the commands wait behind it in the queue.
+    void serial(() => snap($)).catch(error => $.ui.log(`snapshot at the turn's start failed: ${reasonOf(error)}`, { to: 'debug' }))
 
     return next(e)
   })
@@ -997,12 +1013,16 @@ export const register: Register = on => {
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     // Before the command: one that changes files and commits them leaves them compared with that commit.
-    const head = await serial(() => headOf($)).catch(() => null)
+    // A snapshot is taken here only while there is none yet (the mod enabled mid-turn).
+    const before = await serial(async () => ({ head: await headOf($), snap: lastSnap ?? (await snap($).catch(() => null)) })).catch(
+      () => null,
+    )
+    const head = before?.head ?? null
     const ran = await next(e)
     if (ran.deny !== undefined || ran.isError === true || ran.isReadOnly === true) return ran
 
     const edits = bashEditsOf(ran.result)
-    if (edits.files.length > 0 || edits.more.length > 0) {
+    if (edits.files.length > 0 || edits.isPartial) {
       await serial(async () => {
         const track = await ensure($)
         const top = await topOf($)
@@ -1020,11 +1040,20 @@ export const register: Register = on => {
           const base = after === null || edit.hunks.length === 0 ? null : unapply(after, edit.hunks)
           grown = withBase(grown, top, path, { base, isLost: base === null }, head)
         }
-        for (const changed of edits.more) {
-          const path = absolute(changed, cwd)
-          grown = withBase(grown, top, path, { base: null, isLost: true }, head)
-        }
         await keep($, track, grown)
+        if (!edits.isPartial) return
+
+        // The rest the snapshot before tells, against one after; what it cannot (no repo, an ignored file) is lost.
+        const first = before?.snap ?? null
+        const after = first === null ? null : await snap($).catch(error => {
+          $.ui.log(`snapshot after a Bash command failed: ${reasonOf(error)}`, { to: 'debug' })
+          return null
+        })
+        if (first !== null && after !== null) await trackSnapshots($, first, after, head)
+        const now = await ensure($)
+        let rest = now
+        for (const changed of edits.more) rest = withBase(rest, top, absolute(changed, cwd), { base: null, isLost: true }, head)
+        await keep($, now, rest)
       }).catch(error => $.ui.log(`tracking a Bash command failed: ${reasonOf(error)}`, { to: 'debug' }))
     }
     // A command may also have changed files this conversation already follows (a formatter, a revert).
@@ -1033,9 +1062,9 @@ export const register: Register = on => {
     return ran
   })
 
-  // PowerShell's record names no files: snapshots of the work tree before and after the command tell which changed.
+  // PowerShell's record names no files: the latest snapshot and one after the command tell which changed.
   on('tool.call', { tool: 'PowerShell' }, async ($, e, next) => {
-    const before = await serial(async () => ({ snap: await snap($), head: await headOf($) })).catch(error => {
+    const before = await serial(async () => ({ snap: lastSnap ?? (await snap($)), head: await headOf($) })).catch(error => {
       $.ui.log(`snapshot before a PowerShell command failed: ${reasonOf(error)}`, { to: 'debug' })
       return null
     })
@@ -1126,6 +1155,9 @@ export const register: Register = on => {
           : '這個對話改過的檔案現在都跟原本一樣'
 
     let budget = RENDER_BUDGET
+    // A long diff in pieces, the file's name above each after the first: a window of the pane's height always holds
+    // one, a line that wraps aside.
+    const pieceRows = Math.max(10, (e.props.scroll?.bodyRows ?? 40) - 6)
     const rows = files.slice(0, MAX_FILES_DRAWN).map((file, index) => {
       const isOpen = isOpenOf(file)
       const cost = file.chunks.reduce((sum, chunk) => sum + JSON.stringify(chunk).length, 0)
@@ -1186,7 +1218,18 @@ export const register: Register = on => {
             </Box>
           )}
           {file.note !== null && (isOpen || !hasBody(file)) && <Text dimColor>{file.note}</Text>}
-          {isOpen && fits && file.chunks.map(chunk => <Code source={chunk} format="diff" path={file.path} />)}
+          {isOpen &&
+            fits &&
+            piecesOf(file.chunks, pieceRows).map((piece, at) =>
+              at === 0 ? (
+                <Code source={piece} format="diff" path={file.path} />
+              ) : (
+                <Box flexDirection="column">
+                  <Text dimColor wrap="truncate-end">{`${arrow} ${file.rel}（續）`}</Text>
+                  <Code source={piece} format="diff" path={file.path} />
+                </Box>
+              ),
+            )}
           {isOpen && fits && file.hiddenLines > 0 && (
             <Text dimColor>{`… 還有 ${file.hiddenLines} 行 diff 太長沒顯示`}</Text>
           )}
