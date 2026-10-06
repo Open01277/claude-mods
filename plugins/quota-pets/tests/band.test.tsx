@@ -241,10 +241,10 @@ test('the week is seven ghosts that Pac-Man eats, one per day', async ($, on) =>
   // Blue: a day that has come. Dim: one still ahead. Yellow: one eaten before it came. Red: the last of the food.
   const weeks = [
     // Restocked this morning: next week's Saturday, not today's.
-    { pct: 0, resetsIn: 6 * DAY + 12 * HOUR, food: 'ᗧᗣᗣᗣᗣᗣᗣᗣ0%·下週六06:00補貨·滿滿一整袋', lane: 'ᗧwarning ᗣblue ᗣdim ᗣdim ᗣdim ᗣdim ᗣdim ᗣdim' },
+    { pct: 0, resetsIn: 6 * DAY + 12 * HOUR, food: 'ᗧᗣᗣᗣᗣᗣᗣᗣ0%·下週六06:00補貨', lane: 'ᗧwarning ᗣblue ᗣdim ᗣdim ᗣdim ᗣdim ᗣdim ᗣdim' },
     { pct: 60, resetsIn: 5 * DAY, food: '••••ᗧᗣᗣᗣ60%·週四18:00補貨·偷吃到後天的份了', lane: '•dim •dim •dim •warning ᗧwarning ᗣwarning ᗣdim ᗣdim' },
-    { pct: 21, resetsIn: 95 * HOUR, food: '•ᗧᗣᗣᗣᗣᗣᗣ21%·週三17:00補貨·存了2天份', lane: '•dim ᗧwarning ᗣblue ᗣblue ᗣblue ᗣdim ᗣdim ᗣdim' },
-    { pct: 40, resetsIn: 98 * HOUR, food: '••ᗧᗣᗣᗣᗣᗣ40%·週三20:00補貨·照進度在吃', lane: '•dim •dim ᗧwarning ᗣblue ᗣdim ᗣdim ᗣdim ᗣdim' },
+    { pct: 21, resetsIn: 95 * HOUR, food: '•ᗧᗣᗣᗣᗣᗣᗣ21%·週三17:00補貨', lane: '•dim ᗧwarning ᗣblue ᗣblue ᗣblue ᗣdim ᗣdim ᗣdim' },
+    { pct: 40, resetsIn: 98 * HOUR, food: '••ᗧᗣᗣᗣᗣᗣ40%·週三20:00補貨', lane: '•dim •dim ᗧwarning ᗣblue ᗣdim ᗣdim ᗣdim ᗣdim' },
     {
       pct: 60,
       resetsIn: 20 * HOUR,

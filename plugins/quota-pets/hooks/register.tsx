@@ -760,22 +760,22 @@ function dayOf(left: number): number {
 
 // The week's food is seven days' worth: the line compares the day being eaten with the day it is.
 // The restock time is drawn on its own, ahead of the line, so a narrow band cuts the line first.
-function foodLine(week: QuotaPetsLimit, now: number): { text: string; color: string; restock: string | null } {
+// Eating on time or ahead says nothing: the lane shows it, and the line is kept for what needs a look.
+function foodLine(week: QuotaPetsLimit, now: number): { text: string | null; color: string; restock: string | null } {
   const left = week.resetsAt === null ? null : Math.max(0, week.resetsAt - now)
   const restock = week.resetsAt === null || left === null || left === 0 ? null : restockText(week.resetsAt, now)
-  const line = (text: string, color: string) => ({ text, color, restock })
+  const line = (text: string | null, color: string) => ({ text, color, restock })
   if (left === 0) return line('補貨了！等下一筆資料', 'success')
   if (week.pct >= 100) return line('吃光了…這週剩下的日子…牠們要吃什麼…', 'error')
   if (week.pct >= 90) return line('只剩袋底了…袋子裡…好像有東西在動…', 'error')
-  if (left === null) return line('還夠吃', 'success')
-  if (week.pct <= 0 || WEEK_MS - left < 3 * 3600_000) return line('滿滿一整袋', 'success')
+  if (left === null) return line(null, 'success')
+  if (week.pct <= 0 || WEEK_MS - left < 3 * 3600_000) return line(null, 'success')
   const eaten = (week.pct * 7) / 100
   const ahead = Math.floor(eaten) - dayOf(left)
   if (ahead >= 2) return line(`偷吃到${ahead === 2 ? '後天' : `${ahead} 天後`}的份了`, 'warning')
   if (ahead === 1) return line('在偷吃明天的份', 'warning')
   if (left < DAY_MS && 7 - eaten >= 1.5) return line(`最後一天還剩 ${Math.round(7 - eaten)} 天份，吃大餐！`, 'success')
-  if (ahead === 0) return line('照進度在吃', 'success')
-  return line(`存了 ${-ahead} 天份`, 'success')
+  return line(null, 'success')
 }
 
 // The week's food as seven ghosts, one per day, that Pac-Man eats in order; each one eaten leaves a dot.
@@ -803,7 +803,7 @@ const WEEKDAYS = '日一二三四五六'
 
 // A clock time (15:00) is a moment, h and m (1h20m) a length: days away, the moment; on the last day, the countdown.
 function restockText(at: number, now: number): string {
-  if (at - now < DAY_MS) return `${dur(at - now)}後補貨`
+  if (at - now < DAY_MS) return `${dur(at - now)} 後補貨`
   const day = new Date(at).getDay()
   const next = day === new Date(now).getDay() ? '下' : ''
   return `${next}週${WEEKDAYS[day]} ${clockText(at)} 補貨`
@@ -1779,9 +1779,11 @@ export const register: Register = on => {
                 </Text>
                 <Text color={food.color}>{pctText(week.pct)}</Text>
                 {food.restock !== null && <Text dimColor>{`· ${food.restock}`}</Text>}
-                <Text dimColor wrap="truncate-end">
-                  {`· ${food.text}`}
-                </Text>
+                {food.text !== null && (
+                  <Text dimColor wrap="truncate-end">
+                    {`· ${food.text}`}
+                  </Text>
+                )}
               </Box>
             )}
             {cell !== null && (
