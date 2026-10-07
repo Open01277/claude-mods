@@ -10,6 +10,15 @@ const DAY = 24 * HOUR
 const CATS = ['普通貓', '橘貓', '賓士貓', '鍵盤貓', '實習生貓', '墨鏡貓', '工程師貓', '黑貓', 'PM貓', '招財貓', '太空貓', '薛丁格的貓', '液態貓', '貓神']
 const DOGS = ['米克斯', '柴犬', '臘腸狗', '單身狗', '社畜狗', '哈士奇', '黃金獵犬', '吉娃娃', '舔狗', '看門狗', '狗狗幣', '忠犬八公', '熱狗', '狗頭軍師', '地獄三頭犬', '天狗']
 const START = { cwd: '.', surface: 'terminal', isInteractive: true } as never
+// Whose quota the session's login spends, as the profile answers it, and that account's key in the store.
+const PROFILE = JSON.stringify({ account: { uuid: 'acct-1' }, organization: { uuid: 'org-1' } })
+const ACCOUNT = 'acct-1/org-1'
+
+// The server's answer for the quota, as the usage panel reads it.
+function usageText(five: number, week: number, fiveResetsAt = NOW + 2 * HOUR, weekResetsAt = NOW + 4 * DAY): string {
+  const window = (pct: number, at: number) => ({ utilization: pct, resets_at: new Date(at).toISOString() })
+  return JSON.stringify({ five_hour: window(five, fiveResetsAt), seven_day: window(week, weekResetsAt), extra_usage: null })
+}
 
 function limits(five: number, week: number, fiveResetsAt = NOW + 2 * HOUR, weekResetsAt = NOW + 4 * DAY): SessionRateLimit[] {
   return [
@@ -61,9 +70,12 @@ function world(on: On, rateLimits: SessionRateLimit[]) {
     messages: [] as unknown[],
     // What another plugin draws in the band, beneath this one.
     beneath: null as string | null,
-    // What `claude -p /usage` prints; null: it fails, as with no claude on the PATH.
+    // The session's login: a handle, or null with none of Anthropic's (an API key through a gateway).
+    login: 'handle-1' as string | null,
+    // What the server answers for the quota and the account; null: it fails.
     usage: null as string | null,
-    probes: [] as { argv: string[]; env?: Record<string, string> }[],
+    profile: PROFILE as string | null,
+    fetches: [] as { url: string; auth?: string }[],
     commands: [] as string[],
     shown: [] as string[],
   }
@@ -99,11 +111,13 @@ function world(on: On, rateLimits: SessionRateLimit[]) {
     const { Box, Text } = $.ui.resolve(e)
     return state.beneath === null ? <Box /> : <Text>{state.beneath}</Text>
   })
-  on('process.run', ($, e) => {
-    const { argv, init } = e as { argv: string[]; init?: { env?: Record<string, string> } }
-    state.probes.push({ argv: [...argv], ...(init?.env === undefined ? {} : { env: init.env }) })
-    const ran = { stdout: state.usage ?? '', stderr: '', exitCode: state.usage === null ? 1 : 0, isStdoutTruncated: false, isStderrTruncated: false }
-    return { value: ran } as never
+  on('session.authorize', () => ({ value: state.login === null ? null : { handle: state.login, kind: 'bearer' } }) as never)
+  on('http.fetch', ($, e) => {
+    const { url, init } = e as { url: string; init?: { auth?: string } }
+    state.fetches.push({ url, ...(init?.auth === undefined ? {} : { auth: init.auth }) })
+    const text = url.endsWith('/profile') ? state.profile : url.endsWith('/usage') ? state.usage : null
+    const res = { status: text === null ? 500 : 200, ok: text !== null, headers: {}, text: text ?? 'error' }
+    return { value: res } as never
   })
   on('ui.log', ($, e) => {
     state.shown.push(`log: ${(e as { text: string }).text}`)
@@ -611,10 +625,12 @@ test('a conversation shows the quota other conversations read, opened new or com
   const clock = mock.clock(on, { now: NOW })
   // An earlier session read this half an hour ago; the week it saw has restocked since.
   const store = sharedStore(on, {
-    limits: { five: { pct: 58, resetsAt: NOW + 2 * HOUR }, week: { pct: 90, resetsAt: NOW - HOUR }, at: NOW - 30 * MINUTE },
+    [`limits:${ACCOUNT}`]: { five: { pct: 58, resetsAt: NOW + 2 * HOUR }, week: { pct: 90, resetsAt: NOW - HOUR }, at: NOW - 30 * MINUTE },
   })
   const w = world(on, [])
   await $.session.start(START)
+  // Once the server says whose login this is.
+  await clock.advance(10)
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const drawn = await band($, surface)
@@ -624,7 +640,7 @@ test('a conversation shows the quota other conversations read, opened new or com
   }
 
   // Another conversation gets an answer: this one takes its reading up within seconds, nobody saying a word here.
-  store.set('limits', { five: { pct: 41, resetsAt: NOW + 2 * HOUR }, week: { pct: 33, resetsAt: NOW + 3 * DAY }, at: NOW + 5000 })
+  store.set(`limits:${ACCOUNT}`, { five: { pct: 41, resetsAt: NOW + 2 * HOUR }, week: { pct: 33, resetsAt: NOW + 3 * DAY }, at: NOW + 5000 })
   await clock.advance(15_000)
   let drawn = await band($)
   expect(drawn).toContain('41%')
@@ -638,58 +654,84 @@ test('a conversation shows the quota other conversations read, opened new or com
   await $.turn.complete({ turnId: 't1', answer: '', durationMs: 5000, isAborted: false, reason: 'end_turn' } as never)
   drawn = await band($)
   expect(drawn).toContain('44%')
-  expect((store.get('limits') as { five: { pct: number } }).five.pct).toBe(44)
+  expect((store.get(`limits:${ACCOUNT}`) as { five: { pct: number } }).five.pct).toBe(44)
   // An older reading in the store never takes the place of a newer one.
-  store.set('limits', { five: { pct: 10, resetsAt: NOW + 2 * HOUR }, week: null, at: NOW })
+  store.set(`limits:${ACCOUNT}`, { five: { pct: 10, resetsAt: NOW + 2 * HOUR }, week: null, at: NOW })
   await clock.advance(15_000)
   expect(await band($)).toContain('44%')
   // The turn counted from 41%, a reading seconds old: +3 is no big bite, so no toast.
   expect(w.shown.filter(text => !text.startsWith('log:'))).toEqual([])
 })
 
-test('a conversation opened with no fresh reading asks /usage in the background, once for every session', async ($, on) => {
+test('a conversation opened with no fresh reading asks the server with its own login, once for every session', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const store = sharedStore(on, {})
   const w = world(on, [])
-  const reset = new Date(NOW + 2 * HOUR)
-  const time = (date: Date) => `${date.getHours() % 12 || 12}:${String(date.getMinutes()).padStart(2, '0')}${date.getHours() < 12 ? 'am' : 'pm'}`
-  w.usage = [
-    'Current session: 37% used · resets ' + time(reset),
-    'Current week (all models): 20% used · resets Oct 7, 1am',
-  ].join('\n')
+  w.usage = usageText(37, 20)
   await $.session.start(START)
   await clock.advance(10)
 
-  // The probe is a `claude -p` that keeps no session and starts no MCP server, its own copy of the plugin kept still.
-  expect(w.probes).toHaveLength(1)
-  expect(w.probes[0]?.argv).toEqual(['claude', '-p', '--no-session-persistence', '--strict-mcp-config', '/usage'])
-  expect(w.probes[0]?.env).toEqual({ QUOTA_PETS_PROBE: '1' })
+  // Whose login it is, then the quota, both with the session's own login.
+  expect(w.fetches).toEqual([
+    { url: 'https://api.anthropic.com/api/oauth/profile', auth: 'handle-1' },
+    { url: 'https://api.anthropic.com/api/oauth/usage', auth: 'handle-1' },
+  ])
   const drawn = await band($)
   expect(drawn).toContain('37%')
   expect(drawn).toContain('飼料(週)')
-  expect((store.get('limits') as { five: { pct: number } }).five.pct).toBe(37)
+  expect((store.get(`limits:${ACCOUNT}`) as { five: { pct: number } }).five.pct).toBe(37)
 
   // Come back to within two minutes, or another session starting meanwhile: the reading is fresh, nothing is asked.
   await $.session.attach({ surface: 'desktop', clientId: 'desktop:default' } as never)
   await $.session.start(START)
   await clock.advance(30_000)
-  expect(w.probes).toHaveLength(1)
+  expect(w.fetches.filter(one => one.url.endsWith('/usage'))).toHaveLength(1)
 
   // Ten idle minutes later it asks again, for what claude.ai or another machine spent.
-  w.usage = w.usage.replace('37%', '52%')
+  w.usage = usageText(52, 20)
   await clock.advance(10 * MINUTE)
-  expect(w.probes).toHaveLength(2)
+  expect(w.fetches.filter(one => one.url.endsWith('/usage'))).toHaveLength(2)
   expect(await band($)).toContain('52%')
+  // Whose login it is, asked once a conversation: the two started here, and not again while idle.
+  expect(w.fetches.filter(one => one.url.endsWith('/profile'))).toHaveLength(2)
   expect(w.shown.filter(text => !text.startsWith('log:'))).toEqual([])
 })
 
-test('the claude a probe starts keeps the plugin still: no probe of its own, no command', async ($, on) => {
-  mock.clock(on, { now: NOW })
-  mock.store(on)
+test("another account's reading never shows: the terminal's claude logged in elsewhere, or readings kept before accounts", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const other = { five: { pct: 0, resetsAt: NOW + 2 * HOUR }, week: { pct: 13, resetsAt: NOW + 6 * DAY }, at: NOW }
+  const store = sharedStore(on, { 'limits:acct-2/org-2': other, limits: other })
   const w = world(on, [])
-  on('env.get', ($, e) => ({ value: (e as { name: string }).name === 'QUOTA_PETS_PROBE' ? '1' : undefined }) as never)
-  w.usage = 'Current session: 37% used'
+  // The server is not reached for the quota: only what this session's own answers say may show.
   await $.session.start(START)
-  expect(w.probes).toHaveLength(0)
-  expect(w.commands).toEqual([])
+  await clock.advance(10)
+  expect(await band($)).toContain('還沒拿到額度資料')
+
+  w.rateLimits = limits(54, 46)
+  await measure($, w.rateLimits)
+  store.set('limits:acct-2/org-2', { ...other, at: NOW + MINUTE })
+  await clock.advance(MINUTE)
+  const drawn = await band($)
+  expect(drawn).toContain('54%')
+  expect(drawn).toContain('46%')
+  expect(drawn).not.toContain('13%')
+  // Readings from before they were kept by account are let go.
+  expect(store.has('limits')).toBe(false)
+})
+
+test('with no login of its own to ask with, a session shows only its own answers and shares nothing', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const store = sharedStore(on, {})
+  const w = world(on, [])
+  w.login = null
+  w.usage = usageText(37, 20)
+  await $.session.start(START)
+  await clock.advance(10)
+  expect(w.fetches).toEqual([])
+  expect(await band($)).toContain('還沒拿到額度資料')
+
+  w.rateLimits = limits(21, 30)
+  await measure($, w.rateLimits)
+  expect(await band($)).toContain('21%')
+  expect([...store.keys()].filter(key => key.startsWith('limits'))).toEqual([])
 })

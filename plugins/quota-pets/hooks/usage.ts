@@ -1,52 +1,47 @@
-// What `claude -p /usage` prints, read back into the quota windows. The engine hands a plugin the quota only as the
-// last answer reported it; /usage asks the server, with the person's own login, which no plugin ever touches.
+// The quota and whose it is, as the server answers this session's own login: the answers the usage panel reads.
+// Neither path is a documented API, so an answer in any other shape reads as none, and the band waits for one.
 //
-//   Current session: 16% used · resets Oct 5, 3:10am (Asia/Taipei)
-//   Current week (all models): 54% used · resets Oct 7, 1am (Asia/Taipei)
+//   GET /api/oauth/usage    { five_hour: { utilization: 13, resets_at: "2026-10-07T20:00:00+00:00" }, seven_day: ... }
+//   GET /api/oauth/profile  { account: { uuid }, organization: { uuid }, ... }
 
 import type { QuotaPetsLimit } from '../types'
 
-const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
-const DAY_MS = 24 * 3600_000
+export const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+export const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
+export const OAUTH_HEADERS = { 'anthropic-beta': 'oauth-2025-04-20', accept: 'application/json' }
 
-// The reset as the machine's own clock reads it: /usage prints it in the machine's time zone, with no year (and, for
-// a reset later today, perhaps no date). The nearest such moment from a little before now on is the one meant.
-export function resetOf(text: string, now: number): number | null {
-  const match = /resets\s+(?:([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2}),?\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)/i.exec(text)
-  if (match === null) return null
-  const [, month, day, hour = '', minute = '0', half = ''] = match
-  const h = (Number(hour) % 12) + (half.toLowerCase() === 'pm' ? 12 : 0)
-  const m = Number(minute)
-  const today = new Date(now)
-  const candidates: number[] = []
-  if (month === undefined || day === undefined) {
-    for (const add of [0, 1]) {
-      candidates.push(new Date(today.getFullYear(), today.getMonth(), today.getDate() + add, h, m).getTime())
-    }
-  } else {
-    const index = MONTHS.indexOf(month.toLowerCase())
-    if (index < 0) return null
-    for (const year of [today.getFullYear() - 1, today.getFullYear(), today.getFullYear() + 1]) {
-      candidates.push(new Date(year, index, Number(day), h, m).getTime())
-    }
+function parse(text: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
   }
-  const ahead = candidates.filter(at => at > now - 3600_000 && at - now < 8 * DAY_MS).sort((x, y) => x - y)
-  return ahead[0] ?? null
 }
 
-function windowOf(lines: readonly string[], label: RegExp, now: number): QuotaPetsLimit | null {
-  const line = lines.find(one => label.test(one))
-  if (line === undefined) return null
-  const pct = /(\d+(?:\.\d+)?)\s*%\s*used/i.exec(line)
-  if (pct === null) return null
-  return { pct: Number(pct[1]), resetsAt: resetOf(line, now) }
+function field(value: unknown, key: string): unknown {
+  return value !== null && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined
 }
 
-// The 5-hour and weekly windows, or null when the text holds neither (off a subscription, or a format it no longer
-// has: the band then waits for an answer, as it always did).
-export function parseUsage(text: string, now: number): { five: QuotaPetsLimit | null; week: QuotaPetsLimit | null } | null {
-  const lines = text.split(/\r?\n/)
-  const five = windowOf(lines, /^\s*current session\b/i, now)
-  const week = windowOf(lines, /^\s*current week \(all models\)/i, now)
+function windowOf(value: unknown): QuotaPetsLimit | null {
+  const pct = field(value, 'utilization')
+  if (typeof pct !== 'number' || !Number.isFinite(pct)) return null
+  const resets = field(value, 'resets_at')
+  const at = typeof resets === 'string' ? Date.parse(resets) : Number.NaN
+  return { pct, resetsAt: Number.isFinite(at) ? at : null }
+}
+
+// The 5-hour and weekly windows, or null when the answer holds neither (off a subscription, or a shape it no longer has).
+export function usageOf(text: string): { five: QuotaPetsLimit | null; week: QuotaPetsLimit | null } | null {
+  const json = parse(text)
+  const five = windowOf(field(json, 'five_hour'))
+  const week = windowOf(field(json, 'seven_day'))
   return five === null && week === null ? null : { five, week }
+}
+
+// The account and the organization it spends in: one quota each, so readings are kept apart by both.
+export function accountOf(text: string): string | null {
+  const json = parse(text)
+  const account = field(field(json, 'account'), 'uuid')
+  const org = field(field(json, 'organization'), 'uuid')
+  return typeof account === 'string' && account !== '' && typeof org === 'string' && org !== '' ? `${account}/${org}` : null
 }

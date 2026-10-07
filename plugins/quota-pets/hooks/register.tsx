@@ -12,7 +12,7 @@ import type {
   QuotaPetsScene,
 } from '../types'
 import { biggest, categoryName, mealsOf } from './meals'
-import { parseUsage } from './usage'
+import { OAUTH_HEADERS, PROFILE_URL, USAGE_URL, accountOf, usageOf } from './usage'
 import type { Meal } from './meals'
 
 type Rarity = 'N' | 'R' | 'SR' | 'SSR' | 'UR'
@@ -107,14 +107,12 @@ const HALF_HOUR = 30 * MINUTE
 // count its spending from it.
 const SYNC_MS = 15_000
 const STALE_AFTER = 3 * MINUTE
-// /usage is asked when a conversation opens or is come back to with no reading this fresh, and while every
-// conversation is idle once the shared reading is this old; never twice within PROBE_GAP, across all sessions.
+// The server is asked for the quota when a conversation opens or is come back to with no reading this fresh, and
+// while every conversation is idle once the shared reading is this old; never twice within PROBE_GAP, across all
+// sessions of one account.
 const PROBE_FRESH = 2 * MINUTE
 const PROBE_IDLE = 10 * MINUTE
 const PROBE_GAP = MINUTE
-const PROBE_TIMEOUT = 30_000
-// Set on the `claude -p /usage` this plugin starts, whose own copy of the plugin then keeps still.
-const PROBE_ENV = 'QUOTA_PETS_PROBE'
 const DAY_MS = 24 * 3600_000
 const WEEK_MS = 7 * DAY_MS
 // Ten quiet minutes is a break; fifty minutes without one and the pet wants a walk, then asks every half hour.
@@ -1140,11 +1138,31 @@ async function lifeOf(
   return life
 }
 
+// Whose quota this session spends: its own login's account and organization, asked of the server once. Null with
+// no first-party login (an API key, a gateway) or until the server answers; a reading is then this session's alone.
+let account: string | null = null
+// When the server was last asked, so one that does not answer is asked again only after PROBE_GAP.
+let askedAt: number | null = null
+
+async function whose($: EngineInterface, handle: string): Promise<string | null> {
+  if (account !== null) return account
+  const now = await $.clock.now()
+  if (askedAt !== null && now - askedAt >= 0 && now - askedAt < PROBE_GAP) return null
+  askedAt = now
+  const res = await $.http.fetch(PROFILE_URL, { auth: handle, headers: OAUTH_HEADERS })
+  account = res.ok ? accountOf(res.text) : null
+  return account
+}
+
 // The quota is the account's, and a session only reads it from its own answers: every session leaves its latest
-// reading in $.store, a file all of them share, and takes up one newer than its own from there. So a conversation
-// opened, or come back to, shows what another one just read. A window already past its reset is left out.
+// reading in $.store, a file all of them share, under its account, and takes up one newer than its own from there.
+// So a conversation opened, or come back to, shows what another one of the same account just read; one logged in
+// elsewhere (the terminal's `claude` on another account) never mixes in. A window already past its reset is left out.
 async function recall($: EngineInterface): Promise<void> {
-  const kept = (await $.store.get('limits')) as { five?: QuotaPetsLimit | null; week?: QuotaPetsLimit | null; at?: number } | undefined
+  if (account === null) return
+  const kept = (await $.store.get(`limits:${account}`)) as
+    | { five?: QuotaPetsLimit | null; week?: QuotaPetsLimit | null; at?: number }
+    | undefined
   if (kept === undefined || kept === null || typeof kept.at !== 'number') return
   const held = await read($, limitsAtom)
   if (held !== null && (held.at ?? 0) >= kept.at) return
@@ -1157,40 +1175,51 @@ async function recall($: EngineInterface): Promise<void> {
   if (five !== null || week !== null) await update($, limitsAtom, () => ({ five, week, at }))
 }
 
-// Asks /usage in the background, through a `claude -p` of its own, and shares what it says like any reading. Skipped
-// while the shared reading is younger than `fresh`, or another session asked within PROBE_GAP.
+// Asks the server for the quota in the background, with this session's own login (what the usage panel reads), and
+// shares the answer like any reading. Skipped while the account's shared reading is younger than `fresh`, or another
+// of its sessions asked within PROBE_GAP.
 async function probe($: EngineInterface, fresh: number): Promise<void> {
-  const now = await $.clock.now()
-  const kept = (await $.store.get('limits')) as { at?: number } | undefined
-  if (typeof kept?.at === 'number' && now - kept.at < fresh) return
-  const last = (await $.store.get('probe')) as { at?: number } | undefined
-  if (typeof last?.at === 'number' && now - last.at >= 0 && now - last.at < PROBE_GAP) return
-  await $.store.set('probe', { at: now })
-  await update($, probingAtom, () => true)
   try {
-    const ran = await $.process.run(['claude', '-p', '--no-session-persistence', '--strict-mcp-config', '/usage'], {
-      env: { [PROBE_ENV]: '1' },
-      timeoutMs: PROBE_TIMEOUT,
-    })
-    const read = await $.clock.now()
-    // Off a subscription, or no claude on the PATH: the band waits for an answer, as it always did.
-    const found = ran.exitCode === 0 ? parseUsage(ran.stdout, read) : null
+    const auth = await $.session.authorize()
+    // No first-party login: nothing to ask with, and the band waits for an answer, as it always did.
+    if (auth === null) {
+      account = null
+      return
+    }
+    const who = await whose($, auth.handle)
+    if (who === null) return
+    // Now that it is known whose readings these are: the account's newer one taken up, this session's left for it.
+    await serial(() => recall($))
+    const held = await read($, limitsAtom)
+    if (held !== null && typeof held.at === 'number') await serial(() => share($, held.five, held.week, held.at as number))
+    const now = await $.clock.now()
+    const kept = (await $.store.get(`limits:${who}`)) as { at?: number } | undefined
+    if (typeof kept?.at === 'number' && now - kept.at < fresh) return
+    const last = (await $.store.get(`probe:${who}`)) as { at?: number } | undefined
+    if (typeof last?.at === 'number' && now - last.at >= 0 && now - last.at < PROBE_GAP) return
+    await $.store.set(`probe:${who}`, { at: now })
+    await update($, probingAtom, () => true)
+    const res = await $.http.fetch(USAGE_URL, { auth: auth.handle, headers: OAUTH_HEADERS })
+    const found = res.ok ? usageOf(res.text) : null
     if (found === null) return
-    await serial(() => share($, found.five, found.week, read))
+    const at = await $.clock.now()
+    await serial(() => share($, found.five, found.week, at))
   } catch (error) {
-    $.ui.log(`/usage failed: ${String(error)}`, { to: 'debug' })
+    $.ui.log(`quota probe failed: ${String(error)}`, { to: 'debug' })
   } finally {
     await update($, probingAtom, () => false)
   }
 }
 
-// A reading, from this session's answer or a probe: shown here, and left for the others, unless one is newer.
+// A reading, from this session's answer or a probe: shown here, and left for the account's other sessions, unless
+// one is newer. Until the account is known it stays this session's alone.
 async function share($: EngineInterface, five: QuotaPetsLimit | null, week: QuotaPetsLimit | null, at: number): Promise<void> {
   if (five === null && week === null) return
   const held = await read($, limitsAtom)
   if (held === null || (held.at ?? 0) <= at) await update($, limitsAtom, () => ({ five, week, at }))
-  const kept = (await $.store.get('limits')) as { at?: number } | undefined
-  if (typeof kept?.at !== 'number' || kept.at <= at) await $.store.set('limits', { five, week, at })
+  if (account === null) return
+  const kept = (await $.store.get(`limits:${account}`)) as { at?: number } | undefined
+  if (typeof kept?.at !== 'number' || kept.at <= at) await $.store.set(`limits:${account}`, { five, week, at })
 }
 
 // A reading this old is no start to count a turn's spending from.
@@ -1535,32 +1564,32 @@ async function startPreview($: EngineInterface, words: readonly string[]): Promi
   return '預覽：從 10% 一路演到陣亡，每 4 秒換一階（只是演的，真實額度沒有動）'
 }
 
-let isProbe = false
-
 export const register: Register = on => {
   let turnStart: { turnId: string; pct: number; window: number | null } | null = null
   // The turns running now: while one runs, the session is at work.
   const running = new Set<string>()
 
   on('session.start', async ($, e, next) => {
-    // The `claude -p /usage` a probe starts: nothing to draw, and no probe of its own.
-    isProbe = (await $.env.get('QUOTA_PETS_PROBE').catch(() => undefined)) === '1'
-    if (isProbe) return next(e)
     await $.command.register({
       name: 'petdex',
       description: '額度寵物圖鑑：抽過的貓狗、陣亡紀錄、保底（試抽／十連／肚子／預覽）',
       argumentHint: '[試抽 | 十連 | 肚子 | 預覽 [0-100 | 深夜 | 散步 | 肚子 0-100 | 吐 | 減肥] [名字]]',
     })
     if ((await $.store.get('folded')) === true) await update($, foldedAtom, () => true)
+    // A new conversation asks whose login it is again: a /login since may have changed it.
+    account = null
+    askedAt = null
+    // Readings kept before they were kept by account: whose they were is unknown.
+    for (const key of ['limits', 'probe']) await $.store.delete(key)
     const usage = await $.session.usage()
     await serial(() => ingest($, usage.rateLimits))
     await serial(() => recall($))
     await serial(() => digest($, usage.context))
     learnLater($)
-    // A conversation opened with no fresh reading asks /usage, off the start's path.
+    // A conversation opened with no fresh reading asks the server, off the start's path.
     $.clock.after(0, () => void probe($, PROBE_FRESH))
-    // Another conversation's newer reading, taken up soon after it comes; with every conversation idle, /usage now
-    // and then, for what claude.ai or another machine spent.
+    // Another conversation's newer reading, taken up soon after it comes; with every conversation idle, the server
+    // now and then, for what claude.ai or another machine spent.
     $.clock.every(SYNC_MS, () => {
       void serial(() => recall($)).catch(error => $.ui.log(`recall failed: ${String(error)}`, { to: 'debug' }))
       void probe($, PROBE_IDLE)
@@ -1577,7 +1606,6 @@ export const register: Register = on => {
   // The desktop opening this conversation again: what other conversations read meanwhile shows at once.
   on('session.attach', async ($, e, next) => {
     const result = await next(e)
-    if (isProbe) return result
     await serial(() => recall($)).catch(() => undefined)
     $.clock.after(0, () => void probe($, PROBE_FRESH))
 
