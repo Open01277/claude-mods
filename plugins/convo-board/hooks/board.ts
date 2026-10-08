@@ -64,6 +64,11 @@ function nameOf(path: unknown): string {
   return textField(path).split(/[\\/]/).filter(part => part !== '').at(-1) ?? ''
 }
 
+// A command without the step into its folder that leads it: the folder is on the board already.
+function withoutCd(command: string): string {
+  return command.replace(/^\s*(?:cd|Set-Location)\s+(?:"[^"]*"|'[^']*'|[^\s;&]+)\s*(?:&&|;)\s*/i, '')
+}
+
 function hostOf(url: unknown): string {
   try {
     return new URL(textField(url)).host
@@ -77,7 +82,7 @@ export function describeTool(tool: string, input: Readonly<Record<string, unknow
   switch (tool) {
     case 'Bash':
     case 'PowerShell':
-      return `執行 ${firstLine(textField(input.command), 48)}`.trim()
+      return `執行 ${firstLine(withoutCd(textField(input.command)), 48)}`.trim()
     case 'Edit':
     case 'MultiEdit':
     case 'Write':

@@ -513,16 +513,25 @@ export const register: Register = on => {
           ? []
           : [<Button key={`${PEEK}${row.id}`} label={isOpen ? '收起' : '看結果'} onPress={() => void press($, `${PEEK}${row.id}`)} />]),
       ]
+      // A card: the project and how long on top, then the title, what it does, and what the person said.
       return (
-        <Box key={`row:${row.id}`} flexDirection="column">
-          <Box flexDirection="row" columnGap={1}>
-            <Box flexDirection="column" flexGrow={1} flexShrink={1}>
-              <Text bold wrap="truncate-end">{row.title}</Text>
-              <Text dimColor wrap="truncate-end">{row.isDesktop ? row.folder : `${row.folder} · 終端機`}</Text>
+        <Box
+          key={`row:${row.id}`}
+          flexDirection="column"
+          borderStyle="round"
+          borderColor={SECTION_COLOR[row.section]}
+          borderDimColor
+          paddingX={1}
+        >
+          <Box flexDirection="row" justifyContent="space-between" columnGap={1}>
+            <Box flexDirection="row" columnGap={1} flexShrink={1}>
+              <Text bold inverse color={SECTION_COLOR[row.section]} wrap="truncate-end">{` ${row.folder} `}</Text>
+              {!row.isDesktop && <Text dimColor>終端機</Text>}
             </Box>
             <Text dimColor>{row.time}</Text>
           </Box>
-          {row.isError ? <Text color="error">{detail}</Text> : <Text>{detail}</Text>}
+          <Text bold wrap="truncate-end">{row.title}</Text>
+          {row.isError ? <Text color="error">{detail}</Text> : <Text wrap="truncate-end">{detail}</Text>}
           {row.ask !== null && <Text dimColor wrap="truncate-end">{`你說：${row.ask}`}</Text>}
           {buttons.length > 0 && (
             <Box flexDirection="row" columnGap={1}>
@@ -541,7 +550,7 @@ export const register: Register = on => {
           return rows.length === 0
             ? []
             : [
-                <Box key={`section:${section}`} flexDirection="column" rowGap={1}>
+                <Box key={`section:${section}`} flexDirection="column">
                   <Text bold color={SECTION_COLOR[section]}>{`${SECTION_LABEL[section]} ${rows.length}`}</Text>
                   {rows.map(drawRow)}
                 </Box>,

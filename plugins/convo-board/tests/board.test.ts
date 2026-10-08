@@ -36,6 +36,10 @@ function session(id: string, fields: Partial<ConvoBoardSession> = {}): ConvoBoar
 test('a tool call or a dialog reads as a few words', () => {
   expect(describeTool('Bash', { command: 'npm test\nsecond line' })).toBe('執行 npm test')
   expect(describeTool('PowerShell', { command: 'Get-ChildItem' })).toBe('執行 Get-ChildItem')
+  // The step into the folder that leads a command is dropped: the board names the folder.
+  expect(describeTool('Bash', { command: 'cd "D:/程式/Stock" && node -e "x"' })).toBe('執行 node -e "x"')
+  expect(describeTool('PowerShell', { command: "Set-Location 'D:\a b'; npm test" })).toBe('執行 npm test')
+  expect(describeTool('Bash', { command: 'cd src' })).toBe('執行 cd src')
   expect(describeTool('Edit', { file_path: 'D:\\proj\\src\\App.tsx' })).toBe('編輯 App.tsx')
   expect(describeTool('Write', { file_path: '/home/u/notes.md' })).toBe('編輯 notes.md')
   expect(describeTool('Read', { file_path: 'a/b/c.md' })).toBe('讀 c.md')
