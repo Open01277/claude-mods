@@ -10,9 +10,12 @@ import type {
   ConvoDiffUndo,
   ConvoDiffView,
 } from '../types'
+import { ALLOW, gitOpsOf, isAllowed, parseStatus, takesFile } from './clash'
+import type { GitOp, Shell } from './clash'
 import { diffText, isBinary, piecesOf, unapply } from './diff'
 import type { Hunk } from './diff'
 import { gitArgv, isLeftover, parseRaw, parseTree, sameText, withEol } from './git'
+import { absolute, fromMsys, isWindowsPath, keyOf, normalize, relOf } from './paths'
 
 const PLUGIN = 'convo-diff'
 const PANE = 'convo-diff'
@@ -70,54 +73,13 @@ type Found = { base: string | null; isLost: boolean }
 // What a file is compared with: its base, or what the last commit that took it holds.
 type Against = Found & { isCommitted: boolean }
 type BashEdit = { path: string; hunks: Hunk[]; isCreated: boolean; isDeleted: boolean }
-// What the store keeps per conversation, so a resumed conversation finds its files.
-type Kept = { v: 1; at: number; track: ConvoDiffTrack }
+// What the store keeps per conversation, so a resumed conversation finds its files, and so the other conversations
+// know which files are its and how to name it: its desktop session and title.
+type Kept = { v: 1; at: number; track: ConvoDiffTrack; session?: string | null; title?: string | null }
 
 function reasonOf(error: unknown): string {
   const text = error instanceof Error ? error.message : String(error)
   return (text.split('\n')[0] ?? '').slice(0, 120)
-}
-
-function isWindowsPath(path: string): boolean {
-  return /^[A-Za-z]:[\\/]/.test(path) || /^[\\/]{2}/.test(path)
-}
-
-function absolute(path: string, cwd: string): string {
-  if (/^[A-Za-z]:[\\/]/.test(path) || /^[\\/]/.test(path)) return path
-  return `${cwd.replace(/[\\/]+$/, '')}/${path}`
-}
-
-// Forward slashes, `.` and `..` folded.
-function normalize(path: string): string {
-  const slashed = path.replace(/\\/g, '/')
-  const head = /^[A-Za-z]:\//.test(slashed)
-    ? slashed.slice(0, 3)
-    : slashed.startsWith('//')
-      ? '//'
-      : slashed.startsWith('/')
-        ? '/'
-        : ''
-  const parts: string[] = []
-  for (const part of slashed.slice(head.length).split('/')) {
-    if (part === '' || part === '.') continue
-    if (part === '..') parts.pop()
-    else parts.push(part)
-  }
-  return head + parts.join('/')
-}
-
-// One spelling per file: Windows paths ignore case.
-function keyOf(path: string): string {
-  const normal = normalize(path)
-  return isWindowsPath(path) ? normal.toLowerCase() : normal
-}
-
-// The path inside the repo, or null for a file outside it.
-function relOf(path: string, top: string): string | null {
-  const normal = normalize(path)
-  const base = normalize(top).replace(/\/$/, '')
-  const fold = (text: string) => (isWindowsPath(top) ? text.toLowerCase() : text)
-  return fold(normal).startsWith(`${fold(base)}/`) ? normal.slice(base.length + 1) : null
 }
 
 let topCache: string | null = null
@@ -134,9 +96,7 @@ async function topOf($: EngineInterface): Promise<string> {
   } catch {
     // No git here: the folder the session started in is the repo.
   }
-  // An MSYS git spells D:\x as /d/x.
-  const msys = /^\/([A-Za-z])\/(.*)$/.exec(found)
-  if (msys !== null && /^[A-Za-z]:/.test(root)) found = `${msys[1]}:/${msys[2]}`
+  found = fromMsys(found, root)
   const isAbove = found !== '' && (keyOf(found) === keyOf(root) || relOf(root, found) !== null)
   isGit = isAbove
   topCache = isAbove ? found : root
@@ -244,6 +204,9 @@ function serial<T>(job: () => Promise<T>): Promise<T> {
   return run
 }
 
+// This conversation as the desktop names it: what the other conversations' warnings call it.
+let who: { session: string | null; title: string | null } = { session: null, title: null }
+
 const cache = new Map<string, { base: string | null; isLost: boolean; seen: Seen; file: ConvoDiffFile }>()
 // HEAD at the last refresh: when it moves, every file is looked at again.
 let lastHead: string | null | undefined
@@ -252,7 +215,7 @@ async function persist($: EngineInterface, track: ConvoDiffTrack): Promise<void>
   const encoder = new TextEncoder()
   const sizeOf = (value: unknown) => encoder.encode(JSON.stringify(value) ?? '').length
   const at = await $.clock.now()
-  let kept: Kept = { v: 1, at, track }
+  let kept: Kept = { v: 1, at, track, ...who }
   // One conversation may not crowd out the rest: its largest bases are dropped first.
   if (sizeOf(kept) > STORE_ONE) {
     const files = [...track.files]
@@ -261,7 +224,7 @@ async function persist($: EngineInterface, track: ConvoDiffTrack): Promise<void>
       const file = files[index]
       if (file === undefined) continue
       files[index] = { ...file, base: null, isLost: true }
-      kept = { v: 1, at, track: { ...track, files } }
+      kept = { v: 1, at, track: { ...track, files }, ...who }
       if (sizeOf(kept) <= STORE_ONE) break
     }
   }
@@ -718,14 +681,11 @@ let lastSnap: Snap | null = null
 async function snapsOf($: EngineInterface): Promise<Snaps> {
   if (snaps !== null) return snaps
   const top = await topOf($)
-  let dir = (await gitOut($, top, ['rev-parse', '--absolute-git-dir']).catch(() => '')).trim()
+  const dir = fromMsys((await gitOut($, top, ['rev-parse', '--absolute-git-dir']).catch(() => '')).trim(), top)
   if (dir === '') {
     snaps = 'off'
     return snaps
   }
-  // An MSYS git spells D:\x as /d/x.
-  const msys = /^\/([A-Za-z])\/(.*)$/.exec(dir)
-  if (msys !== null && /^[A-Za-z]:/.test(top)) dir = `${msys[1]}:/${msys[2]}`
   const now = await $.clock.now()
   $.clock.after(0, () => void pruneIndexes($, dir, now))
   snaps = { top, index: `${dir}/convo-diff-${Math.random().toString(36).slice(2, 10)}.index` }
@@ -937,6 +897,233 @@ async function undoRevert($: EngineInterface, key: string, conv: number): Promis
   schedule($, [key])
 }
 
+const DESKTOP = 'ccd_session_mgmt'
+
+// Asks the desktop which session this is and its title; a change reaches the store, where the other conversations
+// read it. Nothing outside the desktop.
+async function identify($: EngineInterface): Promise<void> {
+  let found: typeof who
+  try {
+    const result = await $.mcp.call(DESKTOP, 'get_session', { session_id: 'self' })
+    if (result.isError) return
+    const self = record(JSON.parse(result.content.map(block => (block.type === 'text' ? (block.text ?? '') : '')).join('')))
+    found = {
+      session: typeof self?.sessionId === 'string' ? self.sessionId : null,
+      title: typeof self?.title === 'string' && self.title !== '' ? self.title : null,
+    }
+  } catch {
+    return
+  }
+  if (found.session === who.session && found.title === who.title) return
+  who = found
+  await serial(async () => {
+    const track = await read($, trackAtom)
+    if (track !== null && track.files.length > 0) await persist($, track)
+  })
+}
+
+// Another conversation that changed a file, as warnings name it.
+type Owner = { conv: number; label: string }
+type Clash = { rel: string; owners: Owner[] }
+
+function timeOf(at: number): string {
+  const date = new Date(at)
+  const two = (n: number) => String(n).padStart(2, '0')
+  return `${two(date.getMonth() + 1)}/${two(date.getDate())} ${two(date.getHours())}:${two(date.getMinutes())}`
+}
+
+function labelOf(kept: Record<string, unknown>, conv: number): string {
+  if (typeof kept.session === 'string' && kept.session === who.session) return '這個對話 /clear 之前的部分'
+  if (typeof kept.title === 'string' && kept.title !== '') return `另一個對話「${kept.title}」`
+  return `另一個對話（${timeOf(conv)} 開始）`
+}
+
+// The files the other conversations changed, as the store keeps them, by key: whose they are.
+async function othersOf($: EngineInterface, conv: number): Promise<Map<string, Owner[]>> {
+  const owners = new Map<string, Owner[]>()
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith('conv:') || key === storeKey(conv)) continue
+    const kept = record(await $.store.get(key))
+    const track = record(kept?.track)
+    if (kept === null || kept.v !== 1 || track === null || !Array.isArray(track.files)) continue
+    const other = Number(track.conv)
+    const owner = { conv: other, label: labelOf(kept, other) }
+    for (const file of track.files) {
+      const fileKey = record(file)?.key
+      if (typeof fileKey === 'string') owners.set(fileKey, [...(owners.get(fileKey) ?? []), owner])
+    }
+  }
+  return owners
+}
+
+// Whether a file held changes nobody had committed before this conversation first changed it: what it held then
+// against the commit's. Null where that cannot be told.
+async function isForeign($: EngineInterface, top: string, file: ConvoDiffBase, commit: string | null): Promise<boolean | null> {
+  const rel = relOf(file.path, top)
+  if (file.isLost || commit === null || rel === null) return null
+  let text: string | null = null
+  if (commit !== '') {
+    const blob = (await blobsIn($, top, commit, [rel])).get(rel) ?? null
+    text = blob === null ? null : await blobText($, top, blob)
+    if (blob !== null && text === null) return null
+  }
+  return !sameText(text, file.base)
+}
+
+function listOf(items: readonly string[], most: number): string {
+  return items.length <= most ? items.join('、') : `${items.slice(0, most).join('、')} 等 ${items.length} 個檔案`
+}
+
+function labelsOf(clashes: readonly Clash[]): string {
+  return [...new Set(clashes.flatMap(clash => clash.owners.map(owner => owner.label)))].join('、')
+}
+
+// One line per owner: `- 另一個對話「X」：a.ts、b.ts`.
+function byOwner(clashes: readonly Clash[]): string[] {
+  const groups = new Map<string, string[]>()
+  for (const clash of clashes) {
+    const label = [...new Set(clash.owners.map(owner => owner.label))].join('、')
+    const rels = groups.get(label) ?? []
+    if (!rels.includes(clash.rel)) rels.push(clash.rel)
+    groups.set(label, rels)
+  }
+  return [...groups].map(([label, rels]) => `- ${label}：${listOf(rels, 10)}`)
+}
+
+function relsOf(clashes: readonly Clash[]): string[] {
+  return [...new Set(clashes.map(clash => clash.rel))]
+}
+
+// What the model reads in place of the command's result.
+function refusal(blocked: ReadonlyMap<GitOp, Clash[]>, own: readonly string[]): string {
+  const ops = [...blocked.keys()]
+  const lines: string[] = []
+  for (const op of ops) {
+    lines.push(
+      `[convo-diff] 已擋下：\`${op.text}\` 會把別的對話還沒 commit 的改動${op.kind === 'stage' ? '一起 commit 進去' : '丟掉'}：`,
+      ...byOwner(blocked.get(op) ?? []),
+    )
+  }
+  lines.push('這一整行指令都沒有執行。')
+  if (own.length > 0) lines.push(`這個對話自己改、還沒 commit 的檔案：${listOf(own, 30)}（路徑從 repo 的根目錄算）。`)
+  if (ops.some(op => op.kind === 'stage')) {
+    lines.push(
+      '要 commit 這個對話的改動，請只指定這個對話的檔案：`git add -- <檔案>` 再 `git commit -m "<訊息>" -- <檔案>`（commit 後面也接檔案，暫存區裡別的對話的檔案才不會被一起帶進去）。',
+    )
+  }
+  if (ops.some(op => op.kind === 'discard')) {
+    lines.push(
+      '要還原這個對話的改動，請只指定這個對話的檔案（例如 `git checkout -- <檔案>`）；兩個對話都改過的檔案，請用編輯的方式只改回這個對話的部分（mcp__convo-diff__diff 看得到這個對話改了什麼）。',
+    )
+  }
+  lines.push(`只有在使用者明確要你連別的對話的改動一起處理時，才在指令最後加上 \`${ALLOW}\` 重新執行。`)
+  return lines.join('\n')
+}
+
+// Before a command runs: one whose git would commit, or throw away, changes another conversation made and has not
+// committed is refused; one that commits a file both conversations changed only says so. It fails open: a guard that
+// cannot tell lets the command run.
+async function guard($: EngineInterface, command: string, shell: Shell): Promise<{ deny?: string; notes: string[] }> {
+  try {
+    const top = await topOf($)
+    if (!isGit) return { notes: [] }
+    const inRepoTop = (cwd: string) => keyOf(cwd) === keyOf(top) || relOf(cwd, top) !== null
+    const ops = gitOpsOf(command, shell, await $.session.cwd()).filter(op => inRepoTop(op.cwd))
+    if (ops.length === 0) return { notes: [] }
+    const track = await serial(() => ensure($))
+    const others = await othersOf($, track.conv)
+    if (others.size === 0) return { notes: [] }
+
+    const dirty = parseStatus(await gitOut($, top, ['status', '--porcelain=v1', '-z', '--untracked-files=all']))
+    const mine = new Map(track.files.map(file => [file.key, file]))
+    const head = await headOf($)
+    const keyIn = (rel: string) => keyOf(`${top.replace(/[\\/]+$/, '')}/${rel}`)
+    const blocked = new Map<GitOp, Clash[]>()
+    const shared: Clash[] = []
+    for (const file of dirty) {
+      const owners = others.get(keyIn(file.rel))
+      if (owners === undefined) continue
+      const own = mine.get(keyIn(file.rel))
+      // A file both changed holds the other's changes while what it held before this conversation's first change is
+      // not committed.
+      if (own !== undefined && (await isForeign($, top, own, head)) === false) continue
+      for (const op of ops) {
+        if (!takesFile(op, file, top)) continue
+        const clash = { rel: file.rel, owners }
+        if (own !== undefined && op.kind === 'stage') shared.push(clash)
+        else blocked.set(op, [...(blocked.get(op) ?? []), clash])
+      }
+    }
+
+    const notes =
+      shared.length > 0
+        ? [['[convo-diff] 注意：下面這些檔案這個對話跟別的對話都改過，別的對話的改動還沒 commit，這次會一起 commit 進去：', ...byOwner(shared)].join('\n')]
+        : []
+    if (blocked.size === 0) {
+      if (shared.length > 0) $.ui.toast(`${listOf(relsOf(shared), 3)} 也有${labelsOf(shared)}還沒 commit 的改動，這次會一起 commit`)
+      return { notes }
+    }
+
+    const all = [...blocked.values()].flat()
+    const [first] = blocked.keys()
+    const isDiscard = [...blocked.keys()].some(op => op.kind === 'discard')
+    const what = `${labelsOf(all)}還沒 commit 的 ${listOf(relsOf(all), 3)}`
+    if (isAllowed(command)) {
+      $.ui.toast(`Claude 說是你要求的，convo-diff 放行了 ${first?.text ?? 'git'}：${what} ${isDiscard ? '會被丟掉' : '會一起 commit'}`)
+      return { notes: [...notes, ['[convo-diff] 已照使用者的要求放行，這個指令會動到別的對話還沒 commit 的改動：', ...byOwner(all)].join('\n')] }
+    }
+    $.ui.toast(`convo-diff 擋下了 ${first?.text ?? 'git'}：會把${what} ${isDiscard ? '丟掉' : '一起 commit'}`)
+    const own = dirty.filter(file => mine.has(keyIn(file.rel))).map(file => file.rel)
+    return { deny: refusal(blocked, own), notes: [] }
+  } catch (error) {
+    $.ui.log(`guarding a command failed: ${reasonOf(error)}`, { to: 'debug' })
+    return { notes: [] }
+  }
+}
+
+// After a call: the files this conversation just began to change that hold another conversation's changes not
+// committed yet. The person gets a toast, the model a note beside the call's result.
+async function touchNotes($: EngineInterface, known: ReadonlySet<string> | null): Promise<string[]> {
+  if (known === null) return []
+  try {
+    const track = await read($, trackAtom)
+    const fresh = (track?.files ?? []).filter(file => !known.has(file.key))
+    if (track === null || fresh.length === 0) return []
+    const top = await topOf($)
+    if (!isGit) return []
+    const others = await othersOf($, track.conv)
+    const clashes: Clash[] = []
+    for (const file of fresh) {
+      const owners = others.get(file.key)
+      if (owners === undefined) continue
+      const commit = typeof file.head === 'string' ? file.head : await headOf($)
+      if ((await isForeign($, top, file, commit)) !== true) continue
+      clashes.push({ rel: relOf(file.path, top) ?? normalize(file.path), owners })
+    }
+    if (clashes.length === 0) return []
+    $.ui.toast(`這個對話改到了 ${listOf(relsOf(clashes), 3)}，裡面也有${labelsOf(clashes)}還沒 commit 的改動`)
+    return [
+      [
+        '[convo-diff] 注意：這個對話剛開始改的這些檔案，裡面也有別的對話還沒 commit 的改動（那個對話可能還在改）：',
+        ...byOwner(clashes),
+        '現在這些檔案混著兩個對話的改動：commit 時會連那些改動一起進去；要還原也不能用 git checkout／restore，只能改回這個對話的部分。',
+      ].join('\n'),
+    ]
+  } catch (error) {
+    $.ui.log(`checking for other conversations' changes failed: ${reasonOf(error)}`, { to: 'debug' })
+    return []
+  }
+}
+
+// The keys of the files this conversation follows now: what a call adds to them is what it began to change.
+async function knownKeys($: EngineInterface): Promise<Set<string> | null> {
+  return serial(async () => new Set((await ensure($)).files.map(file => file.key))).catch(() => null)
+}
+
+function withNotes<T extends { context?: readonly string[] }>(ran: T, notes: readonly string[]): T {
+  return notes.length === 0 ? ran : ({ ...ran, context: [...(ran.context ?? []), ...notes] } as T)
+}
+
 export const register: Register = on => {
   // The turns running now: a question asked meanwhile waits for them.
   const running = new Set<string>()
@@ -967,6 +1154,7 @@ export const register: Register = on => {
       void serial(() => ensure($))
         .then(() => schedule($, 'all'))
         .catch(error => $.ui.log(`start failed: ${reasonOf(error)}`, { to: 'debug' }))
+      void identify($).catch(error => $.ui.log(`naming this conversation failed: ${reasonOf(error)}`, { to: 'debug' }))
     })
 
     return next(e)
@@ -997,6 +1185,8 @@ export const register: Register = on => {
     // What the person changed between turns is in this snapshot, so no command takes it for its own. Not awaited: the
     // model thinks meanwhile, and the commands wait behind it in the queue.
     void serial(() => snap($)).catch(error => $.ui.log(`snapshot at the turn's start failed: ${reasonOf(error)}`, { to: 'debug' }))
+    // The desktop names a conversation after its first exchange.
+    void identify($).catch(error => $.ui.log(`naming this conversation failed: ${reasonOf(error)}`, { to: 'debug' }))
 
     return next(e)
   })
@@ -1017,7 +1207,8 @@ export const register: Register = on => {
     // Read before the first touch: the record afterwards cannot tell a new file from one too large to copy.
     const before = await serial(async () => {
       const track = await ensure($)
-      return isTracked(track, path) ? null : { seen: await look($, path), head: await headOf($) }
+      if (isTracked(track, path)) return null
+      return { seen: await look($, path), head: await headOf($), known: new Set(track.files.map(file => file.key)) }
     }).catch(() => null)
 
     const ran = await next(e)
@@ -1038,10 +1229,13 @@ export const register: Register = on => {
     }).catch(error => $.ui.log(`tracking ${path} failed: ${reasonOf(error)}`, { to: 'debug' }))
     schedule($, [keyOf(path)])
 
-    return ran
+    return withNotes(ran, await touchNotes($, before?.known ?? null))
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const guarded = await guard($, e.command, 'bash')
+    if (guarded.deny !== undefined) return { deny: guarded.deny }
+    const known = await knownKeys($)
     // Before the command: one that changes files and commits them leaves them compared with that commit.
     // A snapshot is taken here only while there is none yet (the mod enabled mid-turn).
     const before = await serial(async () => ({ head: await headOf($), snap: lastSnap ?? (await snap($).catch(() => null)) })).catch(
@@ -1089,11 +1283,14 @@ export const register: Register = on => {
     // A command may also have changed files this conversation already follows (a formatter, a revert).
     schedule($, 'all')
 
-    return ran
+    return withNotes(ran, [...guarded.notes, ...(await touchNotes($, known))])
   })
 
   // PowerShell's record names no files: the latest snapshot and one after the command tell which changed.
   on('tool.call', { tool: 'PowerShell' }, async ($, e, next) => {
+    const guarded = await guard($, e.command, 'powershell')
+    if (guarded.deny !== undefined) return { deny: guarded.deny }
+    const known = await knownKeys($)
     const before = await serial(async () => ({ snap: lastSnap ?? (await snap($)), head: await headOf($) })).catch(error => {
       $.ui.log(`snapshot before a PowerShell command failed: ${reasonOf(error)}`, { to: 'debug' })
       return null
@@ -1111,7 +1308,7 @@ export const register: Register = on => {
     }
     schedule($, 'all')
 
-    return ran
+    return withNotes(ran, [...guarded.notes, ...(await touchNotes($, known))])
   })
 
   on('tool.call', { tool: TOOL }, async ($, e) => {

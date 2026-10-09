@@ -142,10 +142,13 @@ type Git = {
   calls: string[][]
   // Commits the files named (all of them by default) as they are now, on top of HEAD.
   commit: (paths?: readonly string[]) => string
+  // Stages the files named as they are now in the repo's own index, as `git add` would.
+  stage: (paths: readonly string[]) => void
 }
 
 // Git beneath the plugin, over the world's files: `add -A` and `write-tree` hash them into trees, `diff-tree` and
-// `cat-file` read those back. Blobs store LF, as core.autocrlf does on Windows.
+// `cat-file` read those back, `status` compares the files with HEAD and the repo's index. Blobs store LF, as
+// core.autocrlf does on Windows.
 function fakeGit(on: On, w: World, top = 'D:/proj'): Git {
   const ids = new Map<string, string>()
   const blobs = new Map<string, string>()
@@ -153,9 +156,17 @@ function fakeGit(on: On, w: World, top = 'D:/proj'): Git {
   const commits = new Map<string, Map<string, string>>()
   let head: string | null = null
   let staged = new Map<string, string>()
+  // The repo's own index where it differs from HEAD.
+  const repoIndex = new Map<string, string>()
   const idOf = (key: string) => {
     const id = ids.get(key) ?? (ids.size + 1).toString(16).padStart(40, '0')
     ids.set(key, id)
+    return id
+  }
+  const blobOf = (text: string) => {
+    const blob = text.replace(/\r\n/g, '\n')
+    const id = idOf(`blob:${blob}`)
+    blobs.set(id, blob)
     return id
   }
   const said = (stdout: string, exitCode = 0) => ({ value: { ...RAN, stdout, exitCode } }) as never
@@ -169,19 +180,45 @@ function fakeGit(on: On, w: World, top = 'D:/proj'): Git {
       for (const path of named) {
         const text = w.files.get(path)
         const rel = path.slice(prefix.length)
+        repoIndex.delete(rel)
         if (text === undefined) {
           tree.delete(rel)
           continue
         }
-        const blob = text.replace(/\r\n/g, '\n')
-        const id = idOf(`blob:${blob}`)
-        blobs.set(id, blob)
-        tree.set(rel, id)
+        tree.set(rel, blobOf(text))
       }
+      if (paths === undefined) repoIndex.clear()
       head = idOf(`commit:${commits.size}`)
       commits.set(head, tree)
       return head
     },
+    stage: paths => {
+      for (const path of paths.map(spelled)) {
+        const text = w.files.get(path)
+        if (text !== undefined) repoIndex.set(path.slice(prefix.length), blobOf(text))
+      }
+    },
+  }
+  // `git status --porcelain=v1 -z`: each file whose index differs from HEAD (X) or whose work tree differs from the
+  // index (Y); `??` for one git does not track.
+  const status = () => {
+    const tree = head === null ? new Map<string, string>() : (commits.get(head) ?? new Map<string, string>())
+    const inTree = [...w.files.keys()].filter(path => path.startsWith(prefix)).map(path => path.slice(prefix.length))
+    const out: string[] = []
+    for (const rel of [...new Set([...tree.keys(), ...repoIndex.keys(), ...inTree])].sort()) {
+      const inHead = tree.get(rel)
+      const inIndex = repoIndex.get(rel) ?? inHead
+      const text = w.files.get(prefix + rel)
+      const now = text === undefined ? undefined : idOf(`blob:${text.replace(/\r\n/g, '\n')}`)
+      if (inIndex === undefined) {
+        if (now !== undefined) out.push(`?? ${rel}`)
+        continue
+      }
+      const x = inHead === inIndex ? ' ' : inHead === undefined ? 'A' : 'M'
+      const y = now === undefined ? 'D' : now === inIndex ? ' ' : 'M'
+      if (x !== ' ' || y !== ' ') out.push(`${x}${y} ${rel}`)
+    }
+    return out.map(entry => `${entry}\0`).join('')
   }
   on('fs.list', () => ({ value: [] }) as never)
   on('process.run', ($, e) => {
@@ -194,6 +231,7 @@ function fakeGit(on: On, w: World, top = 'D:/proj'): Git {
     // Every snapshot goes through an index; nothing else is run on one.
     if ((args[0] === 'add' || args[0] === 'write-tree') !== (index !== undefined)) return said('', 128)
     const [verb, ...rest] = args
+    if (verb === 'status') return said(status())
     if (verb === 'rev-parse' && rest.includes('HEAD')) return head === null ? said('', 1) : said(`${head}\n`)
     if (verb === 'ls-tree') {
       const [, , commit = '', , ...paths] = rest
@@ -1084,4 +1122,218 @@ test('a file kept by an older version, its HEAD unknown, counts as committed whe
   expect(text).toContain('+dos')
   expect(text).not.toContain('-one')
   expect(await patchOf($, { scope: 'all' })).toContain('-one')
+})
+
+const OTHER = NOW - 3_600_000
+
+// Another conversation's line in the store: the files it changed, and what each held before.
+function otherConversation(files: Readonly<Record<string, string | null>>, title: string | null = '修 Tab', session = 'local_other') {
+  const tracked = Object.entries(files).map(([path, base], index) => ({ key: spelled(path), path, base, isLost: false, seq: index + 1, head: null }))
+  return { [`conv:${OTHER}`]: { v: 1, at: OTHER, title, session, track: { conv: OTHER, seq: tracked.length, files: tracked } } }
+}
+
+async function run($: Engine, command: string, tool: 'Bash' | 'PowerShell' = 'Bash') {
+  return (await $.tool.call({ tool, command } as never)) as { deny?: string; context?: readonly string[] }
+}
+
+test("git add -A is refused while another conversation has changes not committed; this conversation's own files go through", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, otherConversation({ [B]: 'b\n' }))
+  const w = world(on, { [A]: 'one\n', [B]: 'b\n' })
+  const git = fakeGit(on, w)
+  git.commit()
+  // The other conversation changed b.txt and has not committed it.
+  w.files.set(spelled(B), 'b, as the other conversation left it\n')
+  await $.session.start(START)
+  await clock.advance(1000)
+  await edit($, A, 'one', 'uno')
+
+  const refused = await run($, 'git add -A && git commit -m "uno" && git push')
+  expect(refused.deny).toContain('`git add -A` 會把別的對話還沒 commit 的改動一起 commit 進去')
+  expect(refused.deny).toContain('- 另一個對話「修 Tab」：b.txt')
+  expect(refused.deny).toContain('這一整行指令都沒有執行')
+  expect(refused.deny).toContain('這個對話自己改、還沒 commit 的檔案：a.txt')
+  expect(refused.deny).toContain('# convo-diff:allow')
+  expect(w.toasts.at(-1)).toBe('convo-diff 擋下了 git add -A：會把另一個對話「修 Tab」還沒 commit 的 b.txt 一起 commit')
+
+  // Only this conversation's file: it runs.
+  expect((await run($, 'git add -- a.txt && git commit -m "uno" -- a.txt')).deny).toBeUndefined()
+  // The person's own say-so lets it through, and the person hears of it.
+  const allowed = await run($, 'git add -A && git commit -m "all of it" # convo-diff:allow')
+  expect(allowed.deny).toBeUndefined()
+  expect(allowed.context?.join('\n')).toContain('已照使用者的要求放行')
+  expect(w.toasts.at(-1)).toBe('Claude 說是你要求的，convo-diff 放行了 git add -A：另一個對話「修 Tab」還沒 commit 的 b.txt 會一起 commit')
+})
+
+test("commands that would throw away another conversation's changes are refused, in Bash and in PowerShell", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const C = 'D:\\proj\\c.txt'
+  mock.store(on, otherConversation({ [B]: 'b\n', [C]: null }))
+  const w = world(on, { [A]: 'one\n', [B]: 'b\n' })
+  const git = fakeGit(on, w)
+  git.commit()
+  w.files.set(spelled(B), 'b changed\n')
+  w.files.set(spelled(C), 'made by the other conversation\n')
+  await $.session.start(START)
+  await clock.advance(1000)
+  await edit($, A, 'one', 'uno')
+
+  for (const command of ['git checkout -- .', 'git restore .', 'git reset --hard', 'git stash', 'git checkout -f main']) {
+    for (const tool of ['Bash', 'PowerShell'] as const) {
+      const { deny } = await run($, command, tool)
+      expect(deny).toContain(`\`${command}\` 會把別的對話還沒 commit 的改動丟掉`)
+      expect(deny).toContain('- 另一個對話「修 Tab」：b.txt')
+      // A file git does not track is out of their reach.
+      expect(deny).not.toContain('c.txt')
+    }
+  }
+  // git clean takes what git does not track: the file the other conversation created.
+  expect((await run($, 'git clean -fd')).deny).toContain('- 另一個對話「修 Tab」：c.txt')
+  expect(w.toasts.at(-1)).toBe('convo-diff 擋下了 git clean -fd：會把另一個對話「修 Tab」還沒 commit 的 c.txt 丟掉')
+  // This conversation's own file, by name, goes through.
+  expect((await run($, 'git checkout -- a.txt')).deny).toBeUndefined()
+  expect((await run($, 'git restore a.txt; git stash push -- a.txt', 'PowerShell')).deny).toBeUndefined()
+})
+
+test("another conversation's committed changes stand in no one's way, and commands that take no changes ask git nothing", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, otherConversation({ [B]: 'b\n' }))
+  const w = world(on, { [A]: 'one\n', [B]: 'b\n' })
+  const git = fakeGit(on, w)
+  git.commit()
+  // The other conversation committed its change to b.txt.
+  w.files.set(spelled(B), 'b changed\n')
+  git.commit([B])
+  await $.session.start(START)
+  await clock.advance(1000)
+  await edit($, A, 'one', 'uno')
+
+  expect((await run($, 'git add -A && git commit -m uno')).deny).toBeUndefined()
+  const asked = () => git.calls.filter(args => args[0] === 'status').length
+  const before = asked()
+  await run($, 'git status && git log --oneline -3 && npm test')
+  await run($, 'Get-ChildItem; git diff', 'PowerShell')
+  expect(asked()).toBe(before)
+})
+
+test('with no other conversation, git status is never asked', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, { [A]: 'one\n' })
+  const git = fakeGit(on, w)
+  git.commit()
+  await $.session.start(START)
+  await clock.advance(1000)
+  await edit($, A, 'one', 'uno')
+
+  expect((await run($, 'git add -A && git commit -m uno && git reset --hard')).deny).toBeUndefined()
+  expect(git.calls.filter(args => args[0] === 'status')).toHaveLength(0)
+})
+
+test('a file both conversations changed: its first change warns, committing it says so, throwing it away is refused', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, otherConversation({ [A]: 'one\n', [B]: 'b\n' }))
+  const w = world(on, { [A]: 'one\n', [B]: 'b\n' })
+  const git = fakeGit(on, w)
+  git.commit()
+  w.files.set(spelled(B), 'b\nfrom the other conversation\n')
+  await $.session.start(START)
+  await clock.advance(1000)
+
+  // This conversation starts changing b.txt: the model and the person hear the other's changes are in it.
+  const edited = (await $.tool.call({ tool: 'Edit', file_path: B, old_string: 'b\n', new_string: 'bee\n' } as never)) as {
+    context?: readonly string[]
+  }
+  expect(edited.context?.join('\n')).toContain('- 另一個對話「修 Tab」：b.txt')
+  expect(w.toasts.at(-1)).toBe('這個對話改到了 b.txt，裡面也有另一個對話「修 Tab」還沒 commit 的改動')
+  // Only the first change warns.
+  const again = (await $.tool.call({ tool: 'Edit', file_path: B, old_string: 'bee', new_string: 'BEE' } as never)) as {
+    context?: readonly string[]
+  }
+  expect(again.context).toBeUndefined()
+
+  // Committing it goes through, saying the other's changes go along.
+  const committed = await run($, 'git add b.txt && git commit -m b')
+  expect(committed.deny).toBeUndefined()
+  expect(committed.context?.join('\n')).toContain('這次會一起 commit 進去')
+  expect(w.toasts.at(-1)).toBe('b.txt 也有另一個對話「修 Tab」還沒 commit 的改動，這次會一起 commit')
+  // Throwing it away would take the other's changes with it.
+  expect((await run($, 'git checkout -- b.txt')).deny).toContain('兩個對話都改過的檔案')
+
+  // a.txt is in the other conversation's list too, but nothing of it waits: starting on it warns nothing.
+  const plain = (await $.tool.call({ tool: 'Edit', file_path: A, old_string: 'one', new_string: 'uno' } as never)) as {
+    context?: readonly string[]
+  }
+  expect(plain.context).toBeUndefined()
+})
+
+test('a commit takes what another conversation staged: refused, and a commit naming its own files goes through', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, otherConversation({ [B]: 'b\n' }))
+  const w = world(on, { [A]: 'one\n', [B]: 'b\n' })
+  const git = fakeGit(on, w)
+  git.commit()
+  // The other conversation staged its change, about to commit it.
+  w.files.set(spelled(B), 'b staged\n')
+  git.stage([B])
+  await $.session.start(START)
+  await clock.advance(1000)
+  await edit($, A, 'one', 'uno')
+
+  const { deny } = await run($, 'git add a.txt && git commit -m uno')
+  expect(deny).toContain('`git commit -m` 會把別的對話還沒 commit 的改動一起 commit 進去')
+  expect(deny).not.toContain('`git add a.txt`')
+  expect((await run($, 'git add a.txt && git commit -m uno -- a.txt')).deny).toBeUndefined()
+})
+
+// The store in a map the test reads back.
+function storeOf(on: On, entries: Readonly<Record<string, unknown>>): Map<string, unknown> {
+  const kept = new Map(Object.entries(entries))
+  on('store.get', ($, e) => ({ value: kept.get((e as { key: string }).key) }) as never)
+  on('store.set', ($, e) => {
+    const { key, value } = e as { key: string; value: unknown }
+    kept.set(key, JSON.parse(JSON.stringify(value)))
+    return { value: undefined } as never
+  })
+  on('store.delete', ($, e) => {
+    kept.delete((e as { key: string }).key)
+    return { value: undefined } as never
+  })
+  on('store.keys', () => ({ value: [...kept.keys()] }) as never)
+  return kept
+}
+
+test('other conversations are named by title, by when they began, or as this one before a /clear', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const D = 'D:\\proj\\d.txt'
+  const LATER = OTHER + 60_000
+  const file = (path: string, base: string) => ({ key: spelled(path), path, base, isLost: false, seq: 1, head: null })
+  const kept = storeOf(on, {
+    ...otherConversation({ [B]: 'b\n' }, null, 'local_me'),
+    [`conv:${LATER}`]: { v: 1, at: LATER, track: { conv: LATER, seq: 1, files: [file(D, 'd\n')] } },
+  })
+  const w = world(on, { [A]: 'one\n', [B]: 'b\n', [D]: 'd\n' })
+  // The desktop says which session this is.
+  on('mcp.call', ($, e) => {
+    const { server, tool } = e as { server: string; tool: string }
+    if (server !== 'ccd_session_mgmt' || tool !== 'get_session') throw new Error(`no tool ${tool}`)
+    const text = JSON.stringify({ sessionId: 'local_me', title: '撞車保護' })
+    return { value: { content: [{ type: 'text', text }], isError: false } } as never
+  })
+  const git = fakeGit(on, w)
+  git.commit()
+  w.files.set(spelled(B), 'b changed\n')
+  w.files.set(spelled(D), 'd changed\n')
+  await $.session.start(START)
+  await clock.advance(1000)
+
+  const { deny } = await run($, 'git stash')
+  const date = new Date(LATER)
+  const two = (n: number) => String(n).padStart(2, '0')
+  expect(deny).toContain('- 這個對話 /clear 之前的部分：b.txt')
+  expect(deny).toContain(`- 另一個對話（${two(date.getMonth() + 1)}/${two(date.getDate())} ${two(date.getHours())}:${two(date.getMinutes())} 開始）：d.txt`)
+
+  // This conversation's own line carries its session and title, for the others to name it by.
+  await edit($, A, 'one', 'uno')
+  expect(kept.get(`conv:${NOW}`)).toMatchObject({ session: 'local_me', title: '撞車保護' })
 })
