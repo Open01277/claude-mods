@@ -22,7 +22,7 @@
       "name": "convo-board",
       "source": "./plugins/convo-board",
       "description": "右側看板：別的對話哪些在等你回、哪些跑完了你還沒看、哪些正在跑，一眼看出來，按一下就跳過去；桌面版每個對話打開時自動出現在右邊",
-      "version": "0.1.1"
+      "version": "0.1.2"
     }
   ]
 }

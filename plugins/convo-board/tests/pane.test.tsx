@@ -296,6 +296,40 @@ test('a first click lands as focus and jumps; the click that follows it does not
   await ui.unmount()
 })
 
+test('once the board holds the keys, Tab walks it without jumping, and a click still jumps', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.env(on, { OS: 'Windows_NT' })
+  const w = world(on, $, { 'conv:local_a': entry('local_a', { phase: 'running', turnAt: NOW - MINUTE, doing: '讀 a.ts' }) })
+  w.sessions = [{ sessionId: 'local_a', title: 'A', cwd: 'D:\\程式\\a', link: link('local_a'), isRunning: true }]
+  await $.session.start(START)
+  await clock.settle()
+  const focus = async () => {
+    await $.ui.focus({ component: 'Pane', requestId: PANE, plugin: 'convo-board', element: 'go:local_a', origin: { kind: 'person' } } as never)
+    await clock.settle()
+  }
+
+  const ui = await $.ui.mount({ plugin: 'convo-board', surface: 'desktop', component: 'Pane', props: PANE_PROPS as never, requestId: PANE })
+  // The desktop may draw the board holding the keys just before the ring move of the click that gave them.
+  await ui.redraw({ ...PANE_PROPS, isFocused: true } as never)
+  await focus()
+  expect(w.runs).toHaveLength(1)
+  // Then Tab walks the board without jumping, and a click jumps by itself.
+  await clock.advance(5000)
+  await focus()
+  expect(w.runs).toHaveLength(1)
+  await ui.press({ key: 'go:local_a' })
+  expect(w.runs).toHaveLength(2)
+  await ui.unmount()
+
+  // In the terminal, Tab right after ctrl+x tab only walks it too.
+  await clock.advance(5000)
+  const term = await $.ui.mount({ plugin: 'convo-board', surface: 'terminal', component: 'Pane', props: PANE_PROPS as never, requestId: PANE })
+  await term.redraw({ ...PANE_PROPS, isFocused: true } as never)
+  await focus()
+  expect(w.runs).toHaveLength(2)
+  await term.unmount()
+})
+
 // The person's close mark raises `ui.close`, which a test cannot: the conversation starts with its board closed.
 test('a conversation whose board the person closed opens it no more by itself, until the command opens it', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })

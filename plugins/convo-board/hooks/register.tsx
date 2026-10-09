@@ -34,6 +34,9 @@ const ASK_MAX = 100
 // A press may come twice, by the focus ring and by the click.
 const JUMP_GAP_MS = 1500
 const PEEK_GAP_MS = 600
+// The desktop may draw the board holding the keys before the ring move of the click that gave them arrives: a move
+// this soon after is still that click.
+const TAKE_MS = 500
 const DAY = 24 * 60 * 60_000
 // Lines nobody writes any more: a quiet one goes after three days, any after two weeks.
 const QUIET_KEEP_MS = 3 * DAY
@@ -58,6 +61,8 @@ let listedAt = 0
 let shown = ''
 let lastJump = 0
 const lastPeek = new Map<string, number>()
+// Whether the board holds the keys as last drawn, since when, and whether on the desktop.
+let keys = { isFocused: false, at: 0, isDesktop: false }
 let opener: readonly string[] | null = null
 
 function reasonOf(error: unknown): string {
@@ -288,6 +293,16 @@ async function press($: EngineInterface, key: string): Promise<void> {
   }
 }
 
+async function noteKeys($: EngineInterface, isFocused: boolean, surface: string): Promise<void> {
+  if (isFocused !== keys.isFocused) keys = { isFocused, at: await $.clock.now(), isDesktop: surface === 'desktop' }
+}
+
+// Tab moves the ring only in a board that holds the keys, and there a click presses by itself: a move by the person's
+// hand into a board without them is the click that takes them, which presses nothing.
+function isTake(held: typeof keys, now: number): boolean {
+  return !held.isFocused || (held.isDesktop && now - held.at < TAKE_MS)
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const result = await next(e)
@@ -483,12 +498,23 @@ export const register: Register = on => {
     return result
   })
 
-  // While the prompt holds the keys, a click on the desktop's pane only moves its focus ring onto a button, and the
-  // press waits for a second click: the ring landing there by the person's hand presses it.
+  // While the prompt holds the keys, a click on the desktop's pane only takes them and moves its focus ring onto a
+  // button, and the press waits for a second click: that ring move presses it. Once the board holds the keys, a move
+  // is Tab, which must only walk, or a click that presses by itself.
   on('ui.focus', { component: 'Pane' }, async ($, e, next) => {
+    // As drawn before this move: the drawing after it has the board holding the keys.
+    const held = keys
+    const now = await $.clock.now()
     const result = await next(e)
     const element = e.element
-    if (result.deny === undefined && e.plugin === PLUGIN && e.requestId === PANE && e.origin.kind === 'person' && element !== undefined) {
+    if (
+      result.deny === undefined &&
+      e.plugin === PLUGIN &&
+      e.requestId === PANE &&
+      e.origin.kind === 'person' &&
+      element !== undefined &&
+      isTake(held, now)
+    ) {
       $.clock.after(0, () => void press($, element).catch(() => undefined))
     }
 
@@ -497,6 +523,7 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Button, Markdown, Text } = $.ui.resolve(e)
+    await noteKeys($, e.props.isFocused === true, e.surface)
     const view = await read($, viewAtom)
     const open = await read($, openAtom)
     if (view === null) return <Text dimColor>讀取中…</Text>
