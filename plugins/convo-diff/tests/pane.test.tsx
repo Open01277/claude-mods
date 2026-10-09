@@ -42,6 +42,7 @@ type World = {
   shell: (() => void) | undefined
   status: string | undefined
   opened: string[]
+  closed: string[]
   toasts: string[]
   logs: string[]
 }
@@ -58,6 +59,7 @@ function world(on: On, files: Readonly<Record<string, string>>, root = ROOT): Wo
     shell: undefined,
     status: undefined,
     opened: [],
+    closed: [],
     toasts: [],
     logs: [],
   }
@@ -98,7 +100,10 @@ function world(on: On, files: Readonly<Record<string, string>>, root = ROOT): Wo
     w.opened.push((e as { id: string }).id)
     return { value: { isPlaced: true } } as never
   })
-  on('ui.close', () => ({ value: undefined }) as never)
+  on('ui.close', ($, e) => {
+    w.closed.push((e as { id: string }).id)
+    return { value: undefined } as never
+  })
   on('tool.call', ($, e) => {
     const call = e as unknown as Record<string, string> & { tool: string }
     if (call.tool === 'Edit') {
@@ -455,10 +460,11 @@ test('files fold and unfold, and the choice holds on every surface', async ($, o
   expect(text).not.toContain('+bee')
 })
 
-test("a first click on the desktop's pane lands as focus and presses; the click after it does not press twice", async ($, on) => {
+test("a first click on the desktop's pane presses; once the pane holds the keys, Tab only walks it", async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   mock.store(on)
   const w = world(on, { [A]: 'one\n', [B]: 'b\n' })
+  on('process.run', () => ({ value: { ...RAN, exitCode: 128, stderr: 'fatal: not a git repository' } }) as never)
   on('ui.focus', () => ({}) as never)
   await $.session.start(START)
   await clock.advance(1000)
@@ -466,33 +472,78 @@ test("a first click on the desktop's pane lands as focus and presses; the click 
   await edit($, B, 'b', 'bee')
   await clock.advance(1000)
 
-  const ui = await $.ui.mount({ plugin: 'convo-diff', surface: 'desktop', component: 'Pane', props: PANE_PROPS as never, requestId: 'convo-diff' })
-  expect(await ui.findAll({ type: 'Code' })).toHaveLength(2)
-  const focus = (element: string, origin: object = { kind: 'person' }) =>
-    $.ui.focus({ component: 'Pane', requestId: 'convo-diff', plugin: 'convo-diff', element, origin } as never)
+  const ui = await mountPane($, 'desktop')
+  const codes = async () => (await ui.findAll({ type: 'Code' })).length
+  const focus = async (element: string, origin: object = { kind: 'person' }) => {
+    await $.ui.focus({ component: 'Pane', requestId: 'convo-diff', plugin: 'convo-diff', element, origin } as never)
+    await clock.settle()
+  }
+  const holdsKeys = (isFocused: boolean) => ui.redraw({ ...PANE_PROPS, isFocused } as never)
+  expect(await codes()).toBe(2)
+  // The prompt holds the keys: the click lands as the ring, and that presses.
   await focus('f0')
-  await clock.settle()
-  expect(await ui.findAll({ type: 'Code' })).toHaveLength(1)
+  expect(await codes()).toBe(1)
   // The click itself, right behind the ring: the same press, not a second fold.
   await ui.press({ key: 'f0' })
-  expect(await ui.findAll({ type: 'Code' })).toHaveLength(1)
+  expect(await codes()).toBe(1)
+
+  // The pane holds the keys: Tab walks every button without pressing one.
+  await holdsKeys(true)
   await clock.advance(1000)
+  for (const element of ['scope', 'refresh', 'fold', 'close', 'x0', 'r0']) await focus(element)
+  expect(await codes()).toBe(1)
+  expect(w.closed).toHaveLength(0)
+  expect(w.toasts.filter(text => text.includes('解釋'))).toHaveLength(0)
+  expect(await ui.find({ key: 'rc0' })).toBeUndefined()
+  expect(textOf(await ui.drawn())).not.toContain('整段對話改了')
+  // There a click presses by itself, once, every time.
+  await focus('f0')
   await ui.press({ key: 'f0' })
-  expect(await ui.findAll({ type: 'Code' })).toHaveLength(2)
+  expect(await codes()).toBe(2)
+  await ui.press({ key: 'f0' })
+  await ui.press({ key: 'f0' })
+  expect(await codes()).toBe(2)
 
   // A ring another plugin moves is no click.
-  await clock.advance(1000)
+  await holdsKeys(false)
   await focus('fold', { kind: 'plugin', name: 'x' })
-  await clock.settle()
-  expect(await ui.findAll({ type: 'Code' })).toHaveLength(2)
+  expect(await codes()).toBe(2)
 
-  // A button that writes files waits for the press itself.
+  // The desktop may draw the pane holding the keys just before the ring move of the click that gave them.
+  await clock.advance(1000)
+  await holdsKeys(true)
+  await focus('f1')
+  expect(await codes()).toBe(1)
+
+  // Back from the prompt, one click on 確定還原 reverts, as on any other button.
   await clock.advance(1000)
   await ui.press({ key: 'r0' })
-  await clock.advance(1000)
+  await holdsKeys(false)
   await focus('rc0')
-  await clock.settle()
-  expect(w.files.get(spelled(A))).toBe('uno\n')
+  expect(w.files.get(spelled(A))).toBe('one\n')
+  await ui.unmount()
+})
+
+test('in the terminal, Tab walks a pane that has just taken the keys without pressing', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  world(on, { [A]: 'one\n', [B]: 'b\n' })
+  on('ui.focus', () => ({}) as never)
+  await $.session.start(START)
+  await clock.advance(1000)
+  await edit($, A, 'one', 'uno')
+  await edit($, B, 'b', 'bee')
+  await clock.advance(1000)
+
+  const ui = await mountPane($)
+  // ctrl+x tab gives the pane the keys, and Tab at once walks it.
+  await ui.redraw({ ...PANE_PROPS, isFocused: true } as never)
+  for (const element of ['scope', 'fold', 'f0']) {
+    await $.ui.focus({ component: 'Pane', requestId: 'convo-diff', plugin: 'convo-diff', element, origin: { kind: 'person' } } as never)
+    await clock.settle()
+  }
+  expect(await ui.findAll({ type: 'Code' })).toHaveLength(2)
+  expect(textOf(await ui.drawn())).not.toContain('整段對話改了')
   await ui.unmount()
 })
 

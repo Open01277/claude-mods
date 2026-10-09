@@ -28,9 +28,11 @@ const openAtom = atom({ plugin: 'convo-diff', key: 'open' } as const, null)
 const revertAtom = atom({ plugin: 'convo-diff', key: 'revert' } as const, null)
 
 const DEBOUNCE_MS = 150
+// A ring move and a click on one button this close together are one press.
 const PRESS_GAP_MS = 600
-// Buttons that write files: a Tab onto them cannot be told from a click, so only a press does it.
-const NO_FOCUS_PRESS = /^(rc|u)\d+$/
+// The desktop may draw the pane holding the keys before the ring move of the click that gave them arrives: a move
+// this soon after is still that click.
+const TAKE_MS = 500
 // A drawn tree is refused past 100,000 characters serialized: the diffs get most of it.
 const RENDER_BUDGET = 60_000
 const MAX_FILES_DRAWN = 200
@@ -806,18 +808,27 @@ function openPane($: EngineInterface): Promise<UiOpenResult> {
 
 // What each of the pane's buttons does, as last drawn, so the focus ring landing on one can press it too.
 const actions = new Map<string, () => unknown>()
-let ringPress: { key: string; at: number } | null = null
+let lastPress: { key: string; at: number; isRing: boolean } | null = null
+// Whether the pane holds the keys as last drawn, since when, and whether on the desktop.
+let keys = { isFocused: false, at: 0, isDesktop: false }
 
-// A press may come twice, by the focus ring and by the click: the click right behind the ring is the same press.
+// A press may come twice, by the focus ring and by the click: one of each on one button within the gap is one press.
 async function press($: EngineInterface, key: string, isRing = false): Promise<void> {
   const now = await $.clock.now()
-  if (isRing) {
-    ringPress = { key, at: now }
-  } else if (ringPress !== null && ringPress.key === key && now - ringPress.at < PRESS_GAP_MS) {
-    ringPress = null
-    return
-  }
-  await actions.get(key)?.()
+  const last = lastPress
+  const isEcho = last !== null && last.key === key && last.isRing !== isRing && now - last.at < PRESS_GAP_MS
+  lastPress = isEcho ? null : { key, at: now, isRing }
+  if (!isEcho) await actions.get(key)?.()
+}
+
+async function noteKeys($: EngineInterface, isFocused: boolean, surface: string): Promise<void> {
+  if (isFocused !== keys.isFocused) keys = { isFocused, at: await $.clock.now(), isDesktop: surface === 'desktop' }
+}
+
+// Tab moves the ring only in a pane that holds the keys, and there a click presses by itself: a move by the person's
+// hand into a pane without them is the click that takes them, which presses nothing.
+function isTake(held: typeof keys, now: number): boolean {
+  return !held.isFocused || (held.isDesktop && now - held.at < TAKE_MS)
 }
 
 // The model keeps its own picture of the files: a note in the conversation tells it what changed beneath it.
@@ -1135,6 +1146,7 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Button, Code, Text } = $.ui.resolve(e)
+    await noteKeys($, e.props.isFocused === true, e.surface)
     const view = await read($, viewAtom)
     const open = await read($, openAtom)
     const reverts = await read($, revertAtom)
@@ -1290,10 +1302,13 @@ export const register: Register = on => {
     )
   })
 
-  // While the prompt holds the keys, a click on the desktop's pane only moves its focus ring onto a button, and the
-  // press waits for a second click: the ring landing there by the person's hand presses it, save the buttons that
-  // write files.
+  // While the prompt holds the keys, a click on the desktop's pane only takes them and moves its focus ring onto a
+  // button, and the press waits for a second click: that ring move presses it. Once the pane holds the keys, a move is
+  // Tab, which must only walk, or a click that presses by itself.
   on('ui.focus', { component: 'Pane' }, async ($, e, next) => {
+    // As drawn before this move: the drawing after it has the pane holding the keys.
+    const held = keys
+    const now = await $.clock.now()
     const result = await next(e)
     const element = e.element
     if (
@@ -1302,7 +1317,7 @@ export const register: Register = on => {
       e.requestId === PANE &&
       e.origin.kind === 'person' &&
       element !== undefined &&
-      !NO_FOCUS_PRESS.test(element)
+      isTake(held, now)
     ) {
       $.clock.after(0, () => void press($, element, true).catch(() => undefined))
     }
