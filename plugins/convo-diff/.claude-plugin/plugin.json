@@ -1,6 +1,6 @@
 {
   "name": "convo-diff",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "只看這個對話改過、還沒 commit 的檔案 diff：每個檔案跟它在這個對話第一次被改之前的內容比，commit 過就改跟那次 commit 比，不混進別的對話或手動的修改，PowerShell 改的也算；也能切到「整段對話」只看不還原；每個檔案可以一鍵請 Claude 在對話裡解釋改動，或還原（不會倒掉已經 commit 的）；桌面版在輸入框上方有按鈕直接打開",
   "types": "./types/index.d.ts"
 }

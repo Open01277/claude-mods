@@ -455,6 +455,47 @@ test('files fold and unfold, and the choice holds on every surface', async ($, o
   expect(text).not.toContain('+bee')
 })
 
+test("a first click on the desktop's pane lands as focus and presses; the click after it does not press twice", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, { [A]: 'one\n', [B]: 'b\n' })
+  on('ui.focus', () => ({}) as never)
+  await $.session.start(START)
+  await clock.advance(1000)
+  await edit($, A, 'one', 'uno')
+  await edit($, B, 'b', 'bee')
+  await clock.advance(1000)
+
+  const ui = await $.ui.mount({ plugin: 'convo-diff', surface: 'desktop', component: 'Pane', props: PANE_PROPS as never, requestId: 'convo-diff' })
+  expect(await ui.findAll({ type: 'Code' })).toHaveLength(2)
+  const focus = (element: string, origin: object = { kind: 'person' }) =>
+    $.ui.focus({ component: 'Pane', requestId: 'convo-diff', plugin: 'convo-diff', element, origin } as never)
+  await focus('f0')
+  await clock.settle()
+  expect(await ui.findAll({ type: 'Code' })).toHaveLength(1)
+  // The click itself, right behind the ring: the same press, not a second fold.
+  await ui.press({ key: 'f0' })
+  expect(await ui.findAll({ type: 'Code' })).toHaveLength(1)
+  await clock.advance(1000)
+  await ui.press({ key: 'f0' })
+  expect(await ui.findAll({ type: 'Code' })).toHaveLength(2)
+
+  // A ring another plugin moves is no click.
+  await clock.advance(1000)
+  await focus('fold', { kind: 'plugin', name: 'x' })
+  await clock.settle()
+  expect(await ui.findAll({ type: 'Code' })).toHaveLength(2)
+
+  // A button that writes files waits for the press itself.
+  await clock.advance(1000)
+  await ui.press({ key: 'r0' })
+  await clock.advance(1000)
+  await focus('rc0')
+  await clock.settle()
+  expect(w.files.get(spelled(A))).toBe('uno\n')
+  await ui.unmount()
+})
+
 test('files outside the repo never count, and git finds the repo above where the session started', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   mock.store(on)
