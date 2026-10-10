@@ -970,6 +970,21 @@ async function isForeign($: EngineInterface, top: string, file: ConvoDiffBase, c
   return !sameText(text, file.base)
 }
 
+// Whether a file this conversation changed still holds another's changes nobody has committed: it held them when this
+// conversation first changed it (isForeign at the HEAD then), and no commit has taken the file since. A commit takes
+// the whole file, the other's changes with this one's, as the pane counts it: after one, what is not committed is this
+// conversation's. With that HEAD unknown (a base kept by an older version), against HEAD now.
+async function holdsForeign($: EngineInterface, top: string, file: ConvoDiffBase, head: string | null): Promise<boolean | null> {
+  if (typeof file.head !== 'string') return isForeign($, top, file, head)
+  const rel = relOf(file.path, top)
+  if (rel === null || head === null) return null
+  if (head !== file.head) {
+    const blobAt = async (commit: string) => (commit === '' ? null : ((await blobsIn($, top, commit, [rel])).get(rel) ?? null))
+    if ((await blobAt(head)) !== (await blobAt(file.head))) return false
+  }
+  return isForeign($, top, file, file.head)
+}
+
 function listOf(items: readonly string[], most: number): string {
   return items.length <= most ? items.join('、') : `${items.slice(0, most).join('、')} 等 ${items.length} 個檔案`
 }
@@ -1044,9 +1059,8 @@ async function guard($: EngineInterface, command: string, shell: Shell): Promise
       const owners = others.get(keyIn(file.rel))
       if (owners === undefined) continue
       const own = mine.get(keyIn(file.rel))
-      // A file both changed holds the other's changes while what it held before this conversation's first change is
-      // not committed.
-      if (own !== undefined && (await isForeign($, top, own, head)) === false) continue
+      // A file both changed holds the other's changes until a commit takes it.
+      if (own !== undefined && (await holdsForeign($, top, own, head)) === false) continue
       for (const op of ops) {
         if (!takesFile(op, file, top)) continue
         const clash = { rel: file.rel, owners }

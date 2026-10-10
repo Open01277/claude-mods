@@ -1267,6 +1267,31 @@ test('a file both conversations changed: its first change warns, committing it s
   expect(plain.context).toBeUndefined()
 })
 
+test("a file both conversations changed, once a commit took it, holds nothing of the other's: no more warnings", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on, otherConversation({ [B]: 'b\n' }))
+  const w = world(on, { [A]: 'one\n', [B]: 'b\n' })
+  const git = fakeGit(on, w)
+  git.commit()
+  w.files.set(spelled(B), 'b\nfrom the other conversation\n')
+  await $.session.start(START)
+  await clock.advance(1000)
+  await $.tool.call({ tool: 'Edit', file_path: B, old_string: 'b\n', new_string: 'bee\n' } as never)
+
+  // The commit takes the whole file, the other's changes with this one's.
+  expect((await run($, 'git add b.txt && git commit -m b')).context?.join('\n')).toContain('這次會一起 commit 進去')
+  git.commit([B])
+  await clock.advance(1000)
+
+  // Changed again: committing it, or throwing the new change away, touches nothing of the other's.
+  await $.tool.call({ tool: 'Edit', file_path: B, old_string: 'bee', new_string: 'BEE' } as never)
+  const again = await run($, 'git add b.txt && git commit -m again')
+  expect(again.deny).toBeUndefined()
+  expect(again.context?.join('\n') ?? '').not.toContain('別的對話')
+  expect((await run($, 'git checkout -- b.txt')).deny).toBeUndefined()
+  expect(w.toasts.filter(text => text.includes('這次會一起 commit'))).toHaveLength(1)
+})
+
 test('a commit takes what another conversation staged: refused, and a commit naming its own files goes through', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   mock.store(on, otherConversation({ [B]: 'b\n' }))
