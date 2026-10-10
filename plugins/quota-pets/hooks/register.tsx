@@ -14,7 +14,7 @@ import type {
   QuotaPetsScene,
 } from '../types'
 import { biggest, categoryName, mealsOf } from './meals'
-import { OAUTH_HEADERS, PROFILE_URL, USAGE_URL, accountOf, couponsOf, usageOf } from './usage'
+import { PROFILE_URL, USAGE_URL, accountOf, clientHeaders, couponsOf, usageOf } from './usage'
 import type { Meal } from './meals'
 
 type Rarity = 'N' | 'R' | 'SR' | 'SSR' | 'UR'
@@ -1426,12 +1426,17 @@ let account: string | null = null
 // When the server was last asked, so one that does not answer is asked again only after PROBE_GAP.
 let askedAt: number | null = null
 
+// The headers to ask with, as Claude Code itself asks from this session (clientHeaders).
+async function askHeaders($: EngineInterface): Promise<Record<string, string>> {
+  return clientHeaders((await $.session.version()).version, await $.env.get('CLAUDE_CODE_ENTRYPOINT'))
+}
+
 async function whose($: EngineInterface, handle: string): Promise<string | null> {
   if (account !== null) return account
   const now = await $.clock.now()
   if (askedAt !== null && now - askedAt >= 0 && now - askedAt < PROBE_GAP) return null
   askedAt = now
-  const res = await $.http.fetch(PROFILE_URL, { auth: handle, headers: OAUTH_HEADERS })
+  const res = await $.http.fetch(PROFILE_URL, { auth: handle, headers: await askHeaders($) })
   account = res.ok ? accountOf(res.text) : null
   return account
 }
@@ -1487,7 +1492,7 @@ async function probe($: EngineInterface, fresh: number): Promise<void> {
     if (typeof last?.at === 'number' && now - last.at >= 0 && now - last.at < PROBE_GAP) return
     await $.store.set(`probe:${who}`, { at: now })
     await update($, probingAtom, () => true)
-    const res = await $.http.fetch(USAGE_URL, { auth: auth.handle, headers: OAUTH_HEADERS })
+    const res = await $.http.fetch(USAGE_URL, { auth: auth.handle, headers: await askHeaders($) })
     const found = res.ok ? usageOf(res.text) : null
     if (found === null) return
     const at = await $.clock.now()
