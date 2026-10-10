@@ -973,11 +973,17 @@ function couponLine(pet: Pet, view: CouponView, now: number, seed: number): stri
   return say(lines.hold)
 }
 
-// The reset beside its window's food: red once the food is gone and it is time to press it, yellow in its last days.
-function couponMark(view: CouponView, now: number): { text: string; color: string } {
-  const text = view.left > 1 ? `券×${view.left}` : '券'
-  if (view.limit !== null && view.limit.pct >= 100) return { text, color: 'error' }
-  return { text, color: view.grant.endsAt !== null && view.grant.endsAt - now < COUPON_SOON ? 'warning' : 'magenta' }
+// The color a free reset is said in: red once its window's food is gone and it is time to press it, yellow in its
+// last three days, magenta otherwise.
+function couponColor(view: CouponView, now: number): string {
+  if (view.limit !== null && view.limit.pct >= 100) return 'error'
+  return view.grant.endsAt !== null && view.grant.endsAt - now < COUPON_SOON ? 'warning' : 'magenta'
+}
+
+// The free reset in a few words, for the folded band where the pet's line does not show.
+function couponNote(view: CouponView): string {
+  if (view.limit !== null && view.limit.pct >= 100) return '快去按重置券'
+  return view.grant.endsAt === null ? '有重置券' : `重置券 ${dateText(view.grant.endsAt)} 到期`
 }
 
 // What to do with a free reset as the 5 hours run out: press it if it is for them; if it empties the week too, keep
@@ -2095,13 +2101,15 @@ export const register: Register = on => {
     const week = limits?.week ?? (scene === 'coupon' ? sampleWeek(now) : null)
     const isOver = shown === null && five !== null && five.resetsAt !== null && now >= five.resetsAt
     const countdown = countdownOf(five, now)
-    // The account's free reset; a preview shows none but the one it acts out.
+    // The account's free reset, said by the pet in words and in color (couponColor), and by the folded band in a few
+    // words: no mark of it beside the food. A preview shows none but the one it acts out.
     const coupons = scene === 'coupon' ? sampleCoupons(now) : shown === null ? await read($, couponsAtom) : null
     const coupon = couponOf(coupons, { five, week }, now)
-    const mark = coupon === null ? null : couponMark(coupon, now)
 
     let face = portrait(pet)
     let say = (await read($, probingAtom)) ? '查額度中…' : '還沒拿到額度資料…跟我說句話吧'
+    // The line's own color, when it is the reset talking; dim otherwise.
+    let sayColor: string | undefined
     let stage: Stage | null = null
     if (five !== null && isOver) {
       face = pick(SPECIES[pet.kind].egg, pet.id, held.since)
@@ -2126,6 +2134,7 @@ export const register: Register = on => {
         say = asideLine(pet, aside, slot)
       } else if (coupon !== null && isCalm) {
         say = couponLine(pet, coupon, now, slot)
+        sayColor = couponColor(coupon, now)
       }
     }
     const isCreepy = stage === 'h1' || stage === 'h2' || stage === 'h3' || stage === 'peek'
@@ -2156,7 +2165,7 @@ export const register: Register = on => {
           {five !== null && !isOver && <Text color={barColor(five.pct)}>{`5h ${pctText(five.pct)}`}</Text>}
           {five !== null && !isOver && <Text dimColor>{`· ${countdown} 後重置`}</Text>}
           {isOver && <Text dimColor>5h 已重置</Text>}
-          {mark !== null && <Text color={mark.color}>{mark.text}</Text>}
+          {coupon !== null && <Text color={couponColor(coupon, now)}>{`· ${couponNote(coupon)}`}</Text>}
           <Button key={UNFOLD} label="展開" onPress={() => void setFolded($, false)} />
         </Box>,
       )
@@ -2172,7 +2181,7 @@ export const register: Register = on => {
             {`[${pet.rarity}]`}
           </Text>
           <Text>{pet.name}</Text>
-          <Text dimColor italic={isCreepy} wrap="truncate-end">
+          <Text dimColor={sayColor === undefined} {...paint(sayColor)} italic={isCreepy} wrap="truncate-end">
             {`「${say}」`}
           </Text>
           {isDesktop && <Button key={FOLD} label="收起" onPress={() => void setFolded($, true)} />}
@@ -2184,7 +2193,6 @@ export const register: Register = on => {
                 <Text dimColor>5h</Text>
                 <Text color={barColor(five.pct)}>{bar(five.pct)}</Text>
                 <Text>{pctText(five.pct)}</Text>
-                {mark !== null && coupon?.target === 'five' && <Text color={mark.color}>{mark.text}</Text>}
                 <Text dimColor>{`· ${countdown} 後重置`}</Text>
               </Box>
             )}
@@ -2200,7 +2208,6 @@ export const register: Register = on => {
                   ))}
                 </Text>
                 <Text color={food.color}>{pctText(week.pct)}</Text>
-                {mark !== null && coupon?.target === 'week' && <Text color={mark.color}>{mark.text}</Text>}
                 {food.restock !== null && <Text dimColor>{`· ${food.restock}`}</Text>}
                 {food.text !== null && (
                   <Text dimColor wrap="truncate-end">

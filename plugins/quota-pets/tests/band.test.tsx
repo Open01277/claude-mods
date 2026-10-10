@@ -46,14 +46,16 @@ function grant(left: number, endsAt: number): Record<string, unknown> {
   return { id: 'launch', label: '', resets_total: 1, resets_left: left, ends_at: ends, clears: ['five_hour', 'seven_day'], use_requires_limit: true }
 }
 
-// The reset's mark as drawn, and its color.
-function markOf(node: unknown): string | null {
+// The color of the first text drawn starting with `start` (the pet's line starts with 「), or `dim`.
+function colorOf(node: unknown, start: string): string | null {
   if (node === null || typeof node !== 'object') return null
   const { props, children = [] } = node as { props?: Record<string, unknown>; children?: unknown[] }
   const [only] = children
-  if (children.length === 1 && typeof only === 'string' && only.startsWith('券')) return `${only} ${String(props?.color)}`
+  if (children.length === 1 && typeof only === 'string' && only.startsWith(start)) {
+    return props?.dimColor === true ? 'dim' : String(props?.color)
+  }
   for (const child of children) {
-    const found = markOf(child)
+    const found = colorOf(child, start)
     if (found !== null) return found
   }
   return null
@@ -774,13 +776,21 @@ test('a free reset in hand: the pet keeps on about eating the week through, and 
   await $.session.start(START)
   await clock.advance(10)
 
-  // The week's food carries the reset, one character long.
+  // The week's line stays as it was: no mark of the reset, which the pet says in words, in magenta.
   for (const surface of ['terminal', 'desktop'] as const) {
     const tree = await draw($, surface)
     const drawn = textOf(tree)
-    expect(drawn.slice(drawn.indexOf('飼料(週)')).replace(/\s+/g, '')).toBe('飼料(週)••ᗧᗣᗣᗣᗣᗣ30%券·週三18:00補貨')
-    expect(markOf(tree)).toBe('券 magenta')
+    expect(drawn.slice(drawn.indexOf('飼料(週)')).replace(/\s+/g, '')).toBe('飼料(週)••ᗧᗣᗣᗣᗣᗣ30%·週三18:00補貨')
+    expect(lineOf(drawn)).toMatch(/重置券|吃/)
+    expect(colorOf(tree, '「')).toBe('magenta')
   }
+  // Folded on the desktop, where the pet's line does not show, the band says it in a few words.
+  const ui = await $.ui.mount({ plugin: 'quota-pets', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS as never })
+  await ui.press({ key: 'fold' })
+  const folded = await ui.drawn()
+  expect(textOf(folded)).toContain('· 重置券 10/8 到期')
+  expect(colorOf(folded, '· 重置券')).toBe('magenta')
+  await ui.unmount()
   // Opening a conversation is still quiet.
   expect(w.shown.filter(text => !text.startsWith('log:'))).toEqual([])
 
@@ -816,8 +826,11 @@ test('a free reset in hand: the pet keeps on about eating the week through, and 
   await measure($, w.rateLimits)
   expect(w.shown.filter(text => text.includes('飼料吃光了！快去 設定 → 用量 按「Reset for free」用掉重置券（10/8 到期）'))).toHaveLength(1)
   const pressing = await draw($)
-  expect(markOf(pressing)).toBe('券 error')
   expect(lineOf(textOf(pressing))).toMatch(/按/)
+  expect(colorOf(pressing, '「')).toBe('error')
+  const foldedPressing = await draw($, 'desktop')
+  expect(textOf(foldedPressing)).toContain('· 快去按重置券')
+  expect(colorOf(foldedPressing, '· 快去按')).toBe('error')
 
   // Pressed on claude.ai: the next answers say none is left and the week is new; the next turn cheers, and the pet
   // goes back to its own lines.
@@ -828,8 +841,9 @@ test('a free reset in hand: the pet keeps on about eating the week through, and 
   await turn($, clock, 't3', 1)
   expect(w.shown.filter(text => text.includes('重置券用掉了！新的一袋飼料到手'))).toHaveLength(1)
   const after = await draw($)
-  expect(markOf(after)).toBeNull()
-  expect(lineOf(textOf(after))).not.toMatch(/重置券/)
+  expect(textOf(after)).not.toContain('重置券')
+  expect(colorOf(after, '「')).toBe('dim')
+  expect(await band($, 'desktop')).not.toContain('重置券')
   console.log(w.shown.join('\n'))
 })
 
@@ -866,10 +880,12 @@ test("a new week with the reset still in hand, then the reset's last day", { tim
   await measure($, w.rateLimits)
   // Two days less the eleven hours and the minute of the turn: 36h59m.
   expect(w.shown.filter(text => text.includes('新的一週，新的一袋！手上還有重置券（10/5 到期）：1天12時內吃光就去按，不然就浪費了'))).toHaveLength(1)
-  // A new bag and its last days: the pet says so.
+  // A new bag and its last days: the pet says so, in yellow.
   const said: string[] = []
   for (let index = 0; index < 6; index++) {
-    said.push(lineOf(await band($)))
+    const tree = await draw($)
+    said.push(lineOf(textOf(tree)))
+    expect(colorOf(tree, '「')).toBe('warning')
     await clock.advance(10 * MINUTE)
   }
   console.log(said.join('\n'))
@@ -882,7 +898,6 @@ test("a new week with the reset still in hand, then the reset's last day", { tim
   await $.turn.start({ text: 'go', turnId: 't3' } as never)
   const last = w.shown.filter(text => text.includes('重置券剩 22h59m就過期了，這週飼料吃了 1%：要吃光才按得了，衝啊！'))
   expect(last).toHaveLength(1)
-  expect(markOf(await draw($))).toBe('券 warning')
   console.log(w.shown.join('\n'))
 })
 
@@ -891,7 +906,10 @@ test('/petdex 預覽 券 acts out a reset in hand', async ($, on) => {
   mock.store(on)
   const w = world(on, limits(10, 20))
   await $.session.start(START)
-  expect(markOf(await draw($))).toBeNull()
+  const before = await draw($)
+  expect(textOf(before)).not.toContain('重置券')
+  // The pet's own lines stay dim.
+  expect(colorOf(before, '「')).toBe('dim')
 
   const said = await $.command.run({ command: 'petdex', args: '預覽 券 柴犬' } as never)
   expect(said.text).toContain('預覽「重置券」一分鐘')
@@ -900,8 +918,9 @@ test('/petdex 預覽 券 acts out a reset in hand', async ($, on) => {
     const drawn = textOf(tree)
     expect(drawn).toContain('柴犬')
     expect(drawn).toContain('（預覽中）')
-    expect(markOf(tree)).toBe('券 magenta')
     expect(lineOf(drawn)).toMatch(/重置券|吃/)
+    expect(colorOf(tree, '「')).toBe('magenta')
+    expect(drawn.slice(drawn.indexOf('飼料(週)'))).not.toContain('券')
     console.log(drawn)
   }
   expect(w.shown.filter(text => text.startsWith('【預覽】') && text.includes('發現重置券'))).toHaveLength(1)
