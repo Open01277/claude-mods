@@ -8,6 +8,29 @@ export type QuotaPetsLimits = {
   at?: number
 }
 
+// A free reset of the quota the account was given (the server's `cedar_ember` grants): how many are left, the time
+// it can be pressed in, which limits it empties (`five_hour`, `seven_day`, ...), and whether it works only at a limit.
+export type QuotaPetsGrant = {
+  id: string
+  label: string
+  left: number
+  total: number
+  startsAt: number | null
+  endsAt: number | null
+  clears: string[]
+  isPaused: boolean
+  needsLimit: boolean
+}
+
+// The account's free resets as the server last answered, and when: kept in $.store like the quota, so every
+// conversation of the account shows them. `eligible` and `reason` as the server said them, for /petdex 券.
+export type QuotaPetsCoupons = {
+  grants: QuotaPetsGrant[]
+  eligible: boolean | null
+  reason: string | null
+  at: number
+}
+
 // One conversation's pet: pulled when the conversation starts, re-pulled on each 5-hour reset.
 export type QuotaPetsLife = {
   conv: number
@@ -19,8 +42,8 @@ export type QuotaPetsLife = {
   warned: number
 }
 
-// What /petdex 預覽 acts out besides the quota: a night, a walk, a belly or a compaction.
-export type QuotaPetsScene = 'night' | 'walk' | 'back' | 'belly' | 'burp' | 'slim'
+// What /petdex 預覽 acts out besides the quota: a night, a walk, a belly, a compaction or a free reset in hand.
+export type QuotaPetsScene = 'night' | 'walk' | 'back' | 'belly' | 'burp' | 'slim' | 'coupon'
 
 export type QuotaPetsPreview = {
   pct: number
@@ -60,6 +83,7 @@ declare module 'claude-code' {
   interface PluginState {
     'quota-pets': {
       limits: QuotaPetsLimits | null
+      coupons: QuotaPetsCoupons | null
       pet: QuotaPetsLife | null
       preview: QuotaPetsPreview | null
       belly: QuotaPetsBelly | null

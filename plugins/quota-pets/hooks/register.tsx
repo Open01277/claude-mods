@@ -5,6 +5,8 @@ import type {
   QuotaPetsActivity,
   QuotaPetsBelly,
   QuotaPetsCompaction,
+  QuotaPetsCoupons,
+  QuotaPetsGrant,
   QuotaPetsLife,
   QuotaPetsLimit,
   QuotaPetsLimits,
@@ -12,7 +14,7 @@ import type {
   QuotaPetsScene,
 } from '../types'
 import { biggest, categoryName, mealsOf } from './meals'
-import { OAUTH_HEADERS, PROFILE_URL, USAGE_URL, accountOf, usageOf } from './usage'
+import { OAUTH_HEADERS, PROFILE_URL, USAGE_URL, accountOf, couponsOf, usageOf } from './usage'
 import type { Meal } from './meals'
 
 type Rarity = 'N' | 'R' | 'SR' | 'SSR' | 'UR'
@@ -50,6 +52,22 @@ type Aside =
 // The belly as the band draws it: `fill` is how close auto-compaction is, 1 when it runs.
 type BellyView = { pct: number | null; fill: number | null; compacted: QuotaPetsCompaction | null }
 
+// A free reset as the band talks about it: the one that runs out first, the window it is worth spending on (the week
+// when it empties the week, else the 5 hours), and when that window's food must be eaten through to press it there:
+// the reset running out or the window restocking, whichever comes first.
+type CouponView = {
+  grant: QuotaPetsGrant
+  // The resets every grant still holds.
+  left: number
+  target: 'week' | 'five'
+  limit: QuotaPetsLimit | null
+  deadline: number | null
+}
+
+// The milestones of a free reset already told, and how many each grant held then: kept per account in $.store, so
+// every conversation of it tells each once and a press shows as one fewer.
+type Told = { marks: string[]; left: Record<string, number> }
+
 // What every cat, or every dog, falls back on when the pet brings nothing of its own.
 type Species = {
   label: string
@@ -75,6 +93,16 @@ type Species = {
   slimLines: readonly string[]
   // What it says of the biggest thing in its belly: {meal}, and its size {k}.
   mealLines: readonly string[]
+  // What it keeps saying with a free reset in hand: {date} the reset runs out, {when} the food runs out at this pace,
+  // {need} how fast it must go to run out in time, {left} how long the reset has, {rest} how much food is left.
+  couponLines: {
+    hold: readonly string[]
+    fresh: readonly string[]
+    ahead: readonly string[]
+    behind: readonly string[]
+    soon: readonly string[]
+    press: readonly string[]
+  }
 }
 
 // Kept in $.store so the collection and pity outlive the session. Each conversation's pet is its own key.
@@ -88,6 +116,7 @@ type Save = {
 }
 
 const limitsAtom = atom({ plugin: 'quota-pets', key: 'limits' } as const, null)
+const couponsAtom = atom({ plugin: 'quota-pets', key: 'coupons' } as const, null)
 const lifeAtom = atom({ plugin: 'quota-pets', key: 'pet' } as const, null)
 const previewAtom = atom({ plugin: 'quota-pets', key: 'preview' } as const, null)
 const bellyAtom = atom({ plugin: 'quota-pets', key: 'belly' } as const, null)
@@ -125,6 +154,13 @@ const SLIM_FOR = 10 * MINUTE
 const NIGHT_ENDS = 5
 // How many of the belly's biggest meals /petdex 肚子 lists.
 const MEALS_SHOWN = 5
+// The free resets come with the quota's answer, and are asked for on their own clock: every few minutes while one is
+// held, so a press shows soon, and a few times a day while none is, for a new one.
+const COUPON_FRESH = 5 * MINUTE
+const COUPON_IDLE = 6 * 3600_000
+// In a reset's last three days the pet says how long it has left.
+const COUPON_SOON = 3 * DAY_MS
+const TOLD_KEEP = 40
 
 const whiskers = (face: string) => `(=${face}=)`
 const floppy = (face: string) => `U${face}U`
@@ -174,6 +210,14 @@ const SPECIES: Readonly<Record<Kind, Species>> = {
     burpLines: ['（吐了一顆毛球）…舒服多了喵', '剛剛吐掉的…是前面的對話嗎？有點想不起來了'],
     slimLines: ['減肥成功！身輕如燕喵', '瘦下來了，又可以吃了喵'],
     mealLines: ['最大的一口是 {meal}（≈{k}），好撐喵', '都是 {meal}（≈{k}）害的…我才這麼撐喵'],
+    couponLines: {
+      hold: ['有重置券喵！{date} 前把飼料吃光，就能再拿一袋', '（抱著重置券）吃光這袋，就能免費再開一袋喵'],
+      fresh: ['新的一袋！有重置券在手，這週要吃光喵', '補貨了！這袋吃光就去按重置券喵'],
+      ahead: ['照這速度，{when}就吃得光喵', '吃得很努力喵！{when}就能按重置券了'],
+      behind: ['照這速度吃不完…{need}才行喵', '再吃快一點喵…{need}，才用得到重置券'],
+      soon: ['重置券剩 {left}就過期了喵！還有 {rest}% 沒吃', '（拍桌）重置券 {date} 到期，快吃喵！'],
+      press: ['吃光了！快去按重置券喵！', '（推著重置券）設定 → 用量，按 Reset for free 喵'],
+    },
   },
   dog: {
     label: '狗',
@@ -218,6 +262,14 @@ const SPECIES: Readonly<Record<Kind, Species>> = {
     burpLines: ['（吐完）…汪，肚子空空的好舒服', '前面聊了什麼…我好像忘了汪'],
     slimLines: ['減肥成功！可以再跑十圈汪', '瘦下來了！（原地轉圈）'],
     mealLines: ['（打嗝）最大的一口是 {meal}（≈{k}）', '{meal}（≈{k}）好大一塊…整塊吞下去了汪'],
+    couponLines: {
+      hold: ['（叼著重置券）{date} 前吃光飼料，就能再拿一袋汪', '有重置券汪！吃光這袋就能再開一袋'],
+      fresh: ['新的一袋！有重置券，這週要吃光汪！', '（搖尾巴）補貨了！吃光就去按重置券'],
+      ahead: ['照這速度，{when}就吃得光汪', '（埋頭狂吃）{when}就能按重置券了汪'],
+      behind: ['吃太慢了汪…{need}才吃得光', '（把碗推到你面前）{need}，才用得到重置券'],
+      soon: ['重置券剩 {left}就過期了！汪汪！', '（急得轉圈）重置券 {date} 到期，還有 {rest}% 沒吃'],
+      press: ['吃光了！快去按重置券汪！', '（咬著你的袖子）設定 → 用量，按 Reset for free！'],
+    },
   },
 }
 
@@ -818,6 +870,221 @@ function nightOf(now: number): string {
   return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`
 }
 
+function dateText(at: number): string {
+  const date = new Date(at)
+  return `${date.getMonth() + 1}/${date.getDate()}`
+}
+
+// When something comes, as the pet says it: the hours to it within half a day, then 今天, 明天, a weekday, a date.
+function whenText(at: number, now: number): string {
+  if (at - now < 12 * 3600_000) return `${dur(at - now)} 後`
+  const days = Math.round((new Date(at).setHours(0, 0, 0, 0) - new Date(now).setHours(0, 0, 0, 0)) / DAY_MS)
+  if (days <= 0) return '今天'
+  if (days === 1) return '明天'
+  return days < 7 ? `週${WEEKDAYS[new Date(at).getDay()]}` : dateText(at)
+}
+
+// How fast the rest of the food must go to be gone `ms` from now: a share a day, or all of it in the hours left.
+function needText(rest: number, ms: number): string {
+  const left = Math.max(ms, MINUTE)
+  if (left < DAY_MS) return `${dur(left)} 內要吃 ${Math.ceil(rest)}%`
+  return `每天要吃 ${Math.ceil(rest / (left / DAY_MS))}%`
+}
+
+function isLive(grant: QuotaPetsGrant, now: number): boolean {
+  return grant.left > 0 && (grant.startsAt === null || grant.startsAt <= now) && (grant.endsAt === null || grant.endsAt > now)
+}
+
+// A reset for the 5 hours alone is spent on them; one that empties the week (or does not say) is worth the week.
+function targetOf(grant: QuotaPetsGrant): CouponView['target'] {
+  return grant.clears.includes('five_hour') && !grant.clears.includes('seven_day') ? 'five' : 'week'
+}
+
+// The live reset that runs out first, or null with none. A window already past its reset says nothing until the
+// next reading.
+function couponOf(
+  coupons: QuotaPetsCoupons | null,
+  limits: Pick<QuotaPetsLimits, 'five' | 'week'> | null,
+  now: number,
+): CouponView | null {
+  const live = (coupons?.grants ?? []).filter(grant => isLive(grant, now))
+  const grant = live.reduce<QuotaPetsGrant | null>(
+    (first, one) => (first === null || (one.endsAt ?? Infinity) < (first.endsAt ?? Infinity) ? one : first),
+    null,
+  )
+  if (grant === null) return null
+  const target = targetOf(grant)
+  const reading = (target === 'week' ? limits?.week : limits?.five) ?? null
+  const limit = reading !== null && reading.resetsAt !== null && reading.resetsAt <= now ? null : reading
+  const ends = [grant.endsAt, limit?.resetsAt ?? null].filter((at): at is number => at !== null)
+  return {
+    grant,
+    left: live.reduce((sum, one) => sum + one.left, 0),
+    target,
+    limit,
+    deadline: ends.length === 0 ? null : Math.min(...ends),
+  }
+}
+
+// How the food is going toward a free reset: gone (time to press it), a new bag, gone in time at this pace (and
+// when), or how much faster it must go; `none` with no week to measure against.
+type Pace =
+  | { kind: 'press' }
+  | { kind: 'fresh' }
+  | { kind: 'ahead'; when: string }
+  | { kind: 'behind'; need: string }
+  | { kind: 'none' }
+
+function paceOf(view: CouponView, now: number): Pace {
+  const { limit, deadline } = view
+  if (limit === null) return { kind: 'none' }
+  if (limit.pct >= 100) return { kind: 'press' }
+  if (view.target === 'five' || limit.resetsAt === null || deadline === null) return { kind: 'none' }
+  const spent = WEEK_MS - (limit.resetsAt - now)
+  if (spent < 6 * 3600_000) return { kind: 'fresh' }
+  const empty = limit.pct <= 0 ? Number.POSITIVE_INFINITY : now + ((100 - limit.pct) * spent) / limit.pct
+  if (empty <= deadline) return { kind: 'ahead', when: whenText(empty, now) }
+  return { kind: 'behind', need: needText(100 - limit.pct, deadline - now) }
+}
+
+// What the pet keeps saying with a free reset in hand: press it once the food is gone; otherwise its last days every
+// other line, the reset and its date every third, and how the food is going between.
+function couponLine(pet: Pet, view: CouponView, now: number, seed: number): string {
+  const lines = SPECIES[pet.kind].couponLines
+  const { grant, limit } = view
+  const say = (pool: readonly string[], given: Readonly<Record<string, string>> = {}) => {
+    const words: Record<string, string> = { ...given }
+    if (grant.endsAt !== null) words.date = dateText(grant.endsAt)
+    // A line wanting a word there is none for (a date, for a reset with no end) is left out.
+    const fits = pool.filter(line => [...line.matchAll(/\{(\w+)\}/g)].every(([, key]) => key !== undefined && key in words))
+    const line = pick(fits.length > 0 ? fits : pool, pet.id, seed)
+    return Object.entries(words).reduce((said, [key, word]) => said.replace(`{${key}}`, word), line)
+  }
+  const pace = paceOf(view, now)
+  if (pace.kind === 'press') return say(lines.press)
+  if (grant.endsAt !== null && grant.endsAt - now < COUPON_SOON && seed % 2 === 0) {
+    const rest = limit === null ? {} : { rest: String(Math.round(100 - limit.pct)) }
+    return say(lines.soon, { left: dur(grant.endsAt - now), ...rest })
+  }
+  if (seed % 3 === 0) return say(lines.hold)
+  if (pace.kind === 'fresh') return say(lines.fresh)
+  if (pace.kind === 'ahead') return say(lines.ahead, { when: pace.when })
+  if (pace.kind === 'behind') return say(lines.behind, { need: pace.need })
+  return say(lines.hold)
+}
+
+// The reset beside its window's food: red once the food is gone and it is time to press it, yellow in its last days.
+function couponMark(view: CouponView, now: number): { text: string; color: string } {
+  const text = view.left > 1 ? `券×${view.left}` : '券'
+  if (view.limit !== null && view.limit.pct >= 100) return { text, color: 'error' }
+  return { text, color: view.grant.endsAt !== null && view.grant.endsAt - now < COUPON_SOON ? 'warning' : 'magenta' }
+}
+
+// What to do with a free reset as the 5 hours run out: press it if it is for them; if it empties the week too, keep
+// it until the week's food is gone, or the rest of the week goes with them.
+function wallAdvice(view: CouponView | null, week: QuotaPetsLimit | null, countdown: string): string {
+  if (view === null || !view.grant.clears.includes('five_hour')) return ''
+  if (view.target === 'five') return `｜有重置券，按了就不用等 ${countdown}`
+  if (week === null || week.pct >= 100) return ''
+  return `｜重置券先別按：週飼料還剩 ${Math.round(100 - week.pct)}%，吃光再按才划算`
+}
+
+function dueText(grant: QuotaPetsGrant): string {
+  return grant.endsAt === null ? '' : `（${dateText(grant.endsAt)} 到期）`
+}
+
+function seenToast(view: CouponView): string {
+  const count = view.left > 1 ? ` ×${view.left}` : ''
+  const how = view.target === 'week' ? '把這週的飼料吃光再去按，等於多吃一袋' : '5 小時撞牆時按，就不用等'
+  return `發現重置券${count}${dueText(view.grant)}！${how}｜/petdex 券 看詳情`
+}
+
+function weekToast(view: CouponView, now: number): string {
+  const ends = view.grant.endsAt
+  const restock = view.limit?.resetsAt ?? null
+  // The reset runs out before this week restocks: this week is its last.
+  const goal =
+    ends !== null && restock !== null && ends < restock ? `${dur(ends - now)}內吃光就去按，不然就浪費了` : '這週把飼料吃光就去按'
+  return `新的一週，新的一袋！手上還有重置券${dueText(view.grant)}：${goal}`
+}
+
+function pressToast(view: CouponView): string {
+  return `飼料吃光了！快去 設定 → 用量 按「Reset for free」用掉重置券${dueText(view.grant)}`
+}
+
+function lastToast(view: CouponView, ends: number, now: number): string {
+  const pct = view.target === 'week' && view.limit !== null ? Math.ceil(view.limit.pct) : null
+  const eaten = pct === null ? '' : `，這週飼料吃了 ${pct}%`
+  let tail = '，快去 設定 → 用量 按「Reset for free」'
+  if (pct !== null && pct < 100) tail = view.grant.needsLimit ? '：要吃光才按得了，衝啊！' : `：沒吃光也先按掉吧，能多 ${pct}% 的飼料`
+  return `重置券剩 ${dur(ends - now)}就過期了${eaten}${tail}`
+}
+
+function cheerToast(grant: QuotaPetsGrant): string {
+  const got = targetOf(grant) === 'week' ? '新的一袋飼料到手' : '5 小時的額度補滿了'
+  return `重置券用掉了！${got}${grant.left > 0 ? `（還剩 ${grant.left} 張）` : ''}`
+}
+
+// The toast a free reset is due, if not told yet, most pressing first: the food gone (press it now), its last day,
+// the reset first seen, a new week with it in hand. Any of them also counts the reset and this week as told.
+function milestoneOf(view: CouponView, now: number, told: readonly string[]): { text: string; marks: string[] } | null {
+  const { grant, limit } = view
+  const restock = view.target === 'week' ? (limit?.resetsAt ?? null) : null
+  // A week is known by its restock, to the hour: the server's time wobbles by milliseconds.
+  const week = restock === null ? null : `${grant.id}:${Math.round(restock / 3600_000)}`
+  const quiet = [`seen:${grant.id}`, ...(week === null ? [] : [`week:${week}`])]
+  const isNew = (mark: string) => !told.includes(mark)
+  if (week !== null && limit !== null && limit.pct >= 100 && isNew(`press:${week}`)) {
+    return { text: pressToast(view), marks: [`press:${week}`, ...quiet] }
+  }
+  if (grant.endsAt !== null && grant.endsAt - now < DAY_MS && isNew(`last:${grant.id}`)) {
+    return { text: lastToast(view, grant.endsAt, now), marks: [`last:${grant.id}`, ...quiet] }
+  }
+  if (isNew(`seen:${grant.id}`)) return { text: seenToast(view), marks: quiet }
+  if (week !== null && isNew(`week:${week}`)) return { text: weekToast(view, now), marks: [`week:${week}`] }
+  return null
+}
+
+function toldOf(value: unknown): Told {
+  const told = (value ?? {}) as Partial<Told>
+  const marks = Array.isArray(told.marks) ? told.marks.filter((mark): mark is string => typeof mark === 'string') : []
+  const left = told.left
+  return { marks, left: left !== null && typeof left === 'object' ? left : {} }
+}
+
+// The account's resets as $.store keeps them, or null for anything else there.
+function couponsFrom(value: unknown): QuotaPetsCoupons | null {
+  const coupons = (value ?? {}) as Partial<QuotaPetsCoupons>
+  return typeof coupons.at === 'number' && Array.isArray(coupons.grants) ? (coupons as QuotaPetsCoupons) : null
+}
+
+// The resets were asked for recently enough: within minutes while one is held, within hours while none is.
+function isCouponFresh(coupons: QuotaPetsCoupons | null, now: number): boolean {
+  if (coupons === null) return false
+  return now - coupons.at < (coupons.grants.some(grant => isLive(grant, now)) ? COUPON_FRESH : COUPON_IDLE)
+}
+
+// The reset /petdex 預覽 券 acts out, for the week and the 5 hours with five days left, and the week it goes with
+// when no reading has come.
+function sampleCoupons(now: number): QuotaPetsCoupons {
+  const grant: QuotaPetsGrant = {
+    id: 'preview',
+    label: '',
+    left: 1,
+    total: 1,
+    startsAt: null,
+    endsAt: now + 5 * DAY_MS,
+    clears: ['five_hour', 'seven_day'],
+    isPaused: false,
+    needsLimit: true,
+  }
+  return { grants: [grant], eligible: true, reason: null, at: now }
+}
+
+function sampleWeek(now: number): QuotaPetsLimit {
+  return { pct: 40, resetsAt: now + 3 * DAY_MS }
+}
+
 // A run of work as the pet says it: 52 分鐘, 1 小時 10 分.
 function spanText(ms: number): string {
   const minutes = Math.max(0, Math.floor(ms / MINUTE))
@@ -902,6 +1169,8 @@ function sceneAside(scene: QuotaPetsScene, now: number, belly: BellyView): Aside
   if (scene === 'walk') return { kind: 'walk', ms: 52 * MINUTE }
   if (scene === 'back') return { kind: 'back' }
   if (scene === 'burp' || scene === 'slim') return { kind: 'slim', isAuto: scene === 'burp' }
+  // The reset does the talking.
+  if (scene === 'coupon') return null
   return bellyAside(belly)
 }
 
@@ -1089,14 +1358,21 @@ function reincarnate($: EngineInterface, save: Save, life: QuotaPetsLife, now: n
   return { ...life, id: pet.id, since: now, isDead: false, warned: 0 }
 }
 
-// Death at 100%, and the two creepy warnings on the way there.
-function mourn($: EngineInterface, save: Save, life: QuotaPetsLife, five: QuotaPetsLimit, now: number): QuotaPetsLife {
+// Death at 100%, and the two creepy warnings on the way there. `advice`: what to do with a free reset in hand.
+function mourn(
+  $: EngineInterface,
+  save: Save,
+  life: QuotaPetsLife,
+  five: QuotaPetsLimit,
+  now: number,
+  advice: string,
+): QuotaPetsLife {
   const pet = petById(life.id)
   const species = SPECIES[pet.kind]
   if (five.pct >= 100 && !life.isDead) {
     const entry = save.dex[pet.id] ?? { count: 1, deaths: 0 }
     save.dex[pet.id] = { ...entry, deaths: entry.deaths + 1 }
-    $.ui.toast(`(✖╭╮✖) ${pet.name} 陣亡了…${countdownOf(five, now)} 後轉生，到時候會抽到誰呢…`, {
+    $.ui.toast(`(✖╭╮✖) ${pet.name} 陣亡了…${countdownOf(five, now)} 後轉生，到時候會抽到誰呢…${advice}`, {
       timeoutMs: 10_000,
     })
     $.ui.log(`陣亡 ${pet.name}（上工 ${dur(now - life.since)}）`)
@@ -1158,8 +1434,12 @@ async function whose($: EngineInterface, handle: string): Promise<string | null>
 // reading in $.store, a file all of them share, under its account, and takes up one newer than its own from there.
 // So a conversation opened, or come back to, shows what another one of the same account just read; one logged in
 // elsewhere (the terminal's `claude` on another account) never mixes in. A window already past its reset is left out.
+// The account's free resets are kept and taken up the same way.
 async function recall($: EngineInterface): Promise<void> {
   if (account === null) return
+  const coupons = couponsFrom(await $.store.get(`coupons:${account}`))
+  const shown = await read($, couponsAtom)
+  if (coupons !== null && (shown === null || shown.at < coupons.at)) await update($, couponsAtom, () => coupons)
   const kept = (await $.store.get(`limits:${account}`)) as
     | { five?: QuotaPetsLimit | null; week?: QuotaPetsLimit | null; at?: number }
     | undefined
@@ -1175,9 +1455,10 @@ async function recall($: EngineInterface): Promise<void> {
   if (five !== null || week !== null) await update($, limitsAtom, () => ({ five, week, at }))
 }
 
-// Asks the server for the quota in the background, with this session's own login (what the usage panel reads), and
-// shares the answer like any reading. Skipped while the account's shared reading is younger than `fresh`, or another
-// of its sessions asked within PROBE_GAP.
+// Asks the server for the quota and the free resets in the background, with this session's own login (what the usage
+// panel and Claude Code's reset check read), and shares the answer like any reading. Skipped while the account's
+// shared reading is younger than `fresh` and its resets were asked for recently (isCouponFresh), or another of its
+// sessions asked within PROBE_GAP.
 async function probe($: EngineInterface, fresh: number): Promise<void> {
   try {
     const auth = await $.session.authorize()
@@ -1194,7 +1475,8 @@ async function probe($: EngineInterface, fresh: number): Promise<void> {
     if (held !== null && typeof held.at === 'number') await serial(() => share($, held.five, held.week, held.at as number))
     const now = await $.clock.now()
     const kept = (await $.store.get(`limits:${who}`)) as { at?: number } | undefined
-    if (typeof kept?.at === 'number' && now - kept.at < fresh) return
+    const coupons = couponsFrom(await $.store.get(`coupons:${who}`))
+    if (typeof kept?.at === 'number' && now - kept.at < fresh && isCouponFresh(coupons, now)) return
     const last = (await $.store.get(`probe:${who}`)) as { at?: number } | undefined
     if (typeof last?.at === 'number' && now - last.at >= 0 && now - last.at < PROBE_GAP) return
     await $.store.set(`probe:${who}`, { at: now })
@@ -1204,6 +1486,7 @@ async function probe($: EngineInterface, fresh: number): Promise<void> {
     if (found === null) return
     const at = await $.clock.now()
     await serial(() => share($, found.five, found.week, at))
+    await serial(() => keepCoupons($, { ...couponsOf(res.text), at }))
   } catch (error) {
     $.ui.log(`quota probe failed: ${String(error)}`, { to: 'debug' })
   } finally {
@@ -1220,6 +1503,37 @@ async function share($: EngineInterface, five: QuotaPetsLimit | null, week: Quot
   if (account === null) return
   const kept = (await $.store.get(`limits:${account}`)) as { at?: number } | undefined
   if (typeof kept?.at !== 'number' || kept.at <= at) await $.store.set(`limits:${account}`, { five, week, at })
+}
+
+// The account's free resets as the server just answered, kept like a reading: shown here, and left for its other
+// sessions unless newer ones are there.
+async function keepCoupons($: EngineInterface, coupons: QuotaPetsCoupons): Promise<void> {
+  const held = await read($, couponsAtom)
+  if (held === null || held.at <= coupons.at) await update($, couponsAtom, () => coupons)
+  if (account === null) return
+  const kept = couponsFrom(await $.store.get(`coupons:${account}`))
+  if (kept === null || kept.at <= coupons.at) await $.store.set(`coupons:${account}`, coupons)
+}
+
+// Tells a free reset's milestones (milestoneOf) where the person is: their turn starting, this conversation's answer,
+// coming back to it; never from a conversation left in the background. Each is told once for the account, one toast
+// at a time, and a reset holding fewer than when last told is a press, cheered first.
+async function remind($: EngineInterface): Promise<void> {
+  if (account === null) return
+  const coupons = await read($, couponsAtom)
+  const pet = await petNow($)
+  if (coupons === null || pet === null) return
+  const now = await $.clock.now()
+  const key = `told:${account}`
+  const told = toldOf(await $.store.get(key))
+  const used = coupons.grants.find(grant => (told.left[grant.id] ?? grant.left) > grant.left)
+  const view = couponOf(coupons, await read($, limitsAtom), now)
+  const due = used === undefined && view !== null ? milestoneOf(view, now, told.marks) : null
+  const text = used === undefined ? (due?.text ?? null) : cheerToast(used)
+  if (text !== null) $.ui.toast(`${portrait(pet)} ${text}`, { timeoutMs: 12_000 })
+  const marks = [...new Set([...told.marks, ...(due?.marks ?? [])])].slice(-TOLD_KEEP)
+  const next: Told = { marks, left: Object.fromEntries(coupons.grants.map(grant => [grant.id, grant.left])) }
+  if (JSON.stringify(next) !== JSON.stringify(told)) await $.store.set(key, next)
 }
 
 // A reading this old is no start to count a turn's spending from.
@@ -1243,7 +1557,8 @@ async function ingest($: EngineInterface, rateLimits: readonly SessionRateLimit[
     if (five.resetsAt !== null && (life.window === null || five.resetsAt > life.window)) {
       life = { ...life, window: five.resetsAt }
     }
-    life = { ...mourn($, save, life, five, now), lastPct: five.pct }
+    const advice = wallAdvice(couponOf(await read($, couponsAtom), { five, week }, now), week, countdownOf(five, now))
+    life = { ...mourn($, save, life, five, now, advice), lastPct: five.pct }
   }
   if (JSON.stringify(save) !== before) await $.store.set('save', save)
   await $.store.set(lifeKey(conv), life)
@@ -1415,6 +1730,58 @@ async function bellyText($: EngineInterface): Promise<string> {
   return lines.join('\n')
 }
 
+const CLEARS: Readonly<Record<string, string>> = {
+  five_hour: '5 小時',
+  seven_day: '每週',
+  seven_day_opus: 'Opus 每週',
+  seven_day_sonnet: 'Sonnet 每週',
+}
+
+function paceText(pace: Pace): string | null {
+  if (pace.kind === 'press') return '吃光了，現在就能按'
+  if (pace.kind === 'fresh') return '剛補貨，從現在開始吃'
+  if (pace.kind === 'ahead') return `照這速度，${pace.when}就吃得光`
+  if (pace.kind === 'behind') return `照這速度吃不完：${pace.need}才吃得光`
+  return null
+}
+
+// /petdex 券: the account's free resets, what each empties and until when, and how the food is going toward them.
+async function couponText($: EngineInterface): Promise<string> {
+  const coupons = await read($, couponsAtom)
+  const now = await $.clock.now()
+  if (coupons === null) return '還沒問過重置券：開著的對話幾分鐘內會用這個對話的登入順便問（不用 token）'
+  const rows = coupons.grants.map(grant => {
+    const name = grant.label === '' ? '重置券' : grant.label
+    const ends =
+      grant.endsAt === null
+        ? '沒有期限'
+        : `${dateText(grant.endsAt)} ${clockText(grant.endsAt)} 到期（${grant.endsAt > now ? `還有 ${dur(grant.endsAt - now)}` : '已過期'}）`
+    const clears = grant.clears.length === 0 ? '沒說' : grant.clears.map(kind => CLEARS[kind] ?? kind).join('、')
+    const how = grant.needsLimit ? '要撞到上限才能按' : '隨時可以按'
+    const state = grant.isPaused ? '｜暫停中' : grant.startsAt !== null && grant.startsAt > now ? `｜${dateText(grant.startsAt)} 才開始` : ''
+    return `・${name}：剩 ${grant.left}/${grant.total} 次｜${ends}｜會清掉：${clears}｜${how}${state}`
+  })
+  const lines = rows.length === 0 ? ['目前沒有重置券'] : ['重置券：', ...rows]
+  if (coupons.eligible === false) lines.push(`（伺服器說現在不能用${coupons.reason === null ? '' : `：${coupons.reason}`}）`)
+  const view = couponOf(coupons, await read($, limitsAtom), now)
+  if (view !== null) {
+    const { limit } = view
+    if (limit !== null) {
+      const name = view.target === 'week' ? '這週飼料' : '這 5 小時'
+      const restock =
+        limit.resetsAt === null
+          ? ''
+          : `，${view.target === 'week' ? restockText(limit.resetsAt, now) : `${dur(limit.resetsAt - now)} 後重置`}`
+      lines.push('', `${name}吃了 ${pctText(limit.pct)}${restock}`)
+    }
+    const pace = paceText(paceOf(view, now))
+    if (pace !== null) lines.push(pace)
+    lines.push('', '按法：桌面版或網頁版的 設定 → 用量 →「Reset for free」（用掉就沒了，週補貨的日子不會變）')
+  }
+  lines.push(`（${dur(now - coupons.at)}前問的）`)
+  return lines.join('\n')
+}
+
 async function dexText($: EngineInterface): Promise<string> {
   const save = await serial(() => load($))
   const life = await read($, lifeAtom)
@@ -1435,9 +1802,11 @@ async function dexText($: EngineInterface): Promise<string> {
     const dead = life.isDead ? '（已陣亡，等待轉生）' : ''
     const belly = await read($, bellyAtom)
     const streak = streakOf(await read($, activityAtom), now)
+    const coupon = couponOf(await read($, couponsAtom), await read($, limitsAtom), now)
     const extras = [
       belly !== null && belly.conv === life.conv && belly.pct !== null ? `肚子 ${belly.pct}%` : null,
       streak >= MINUTE ? `已經連續寫 ${spanText(streak)}` : null,
+      coupon !== null ? `重置券 ×${coupon.left}${dueText(coupon.grant)}` : null,
     ].filter((extra): extra is string => extra !== null)
     current = `這個對話：${portrait(pet)} ${pet.name} [${pet.rarity}]，上工 ${dur(now - life.since)}${dead}${extras.map(extra => `｜${extra}`).join('')}`
   }
@@ -1453,9 +1822,10 @@ async function dexText($: EngineInterface): Promise<string> {
     '最近：',
     ...save.history.map(line => `・${line}`),
     '',
-    '玩法：/petdex 試抽 ｜ /petdex 十連 ｜ /petdex 肚子 ｜ /petdex 預覽 ｜ /petdex 預覽 95 柴犬',
-    '　　　/petdex 預覽 深夜｜散步｜回來｜肚子 85｜吐｜減肥（可以接名字）',
+    '玩法：/petdex 試抽 ｜ /petdex 十連 ｜ /petdex 肚子 ｜ /petdex 券 ｜ /petdex 預覽 ｜ /petdex 預覽 95 柴犬',
+    '　　　/petdex 預覽 深夜｜散步｜回來｜肚子 85｜吐｜減肥｜券（可以接名字）',
     '肚子是 context：快自動壓縮時會撐、壓縮完會吐（/compact 是減肥），/petdex 肚子 看牠吃了什麼。連續寫 50 分鐘會吵著散步，半夜會催你睡。',
+    '有重置券時，牠會一直催你把這週的飼料吃光再去按，/petdex 券 看還剩幾張、哪天到期、照這速度吃不吃得完。',
   ].join('\n')
 }
 
@@ -1484,6 +1854,8 @@ const SCENES: Readonly<Record<string, QuotaPetsScene>> = {
   burp: 'burp',
   減肥: 'slim',
   slim: 'slim',
+  券: 'coupon',
+  coupon: 'coupon',
 }
 const SCENE_LABEL: Record<QuotaPetsScene, string> = {
   night: '深夜',
@@ -1492,6 +1864,7 @@ const SCENE_LABEL: Record<QuotaPetsScene, string> = {
   belly: '肚子',
   burp: '撐到吐',
   slim: '減肥成功',
+  coupon: '重置券',
 }
 
 // The toast a scene would pop for real, if it pops one: acted out at an hour that fits it.
@@ -1501,6 +1874,11 @@ async function sceneToast($: EngineInterface, pet: Pet, preview: QuotaPetsPrevie
   if (scene === 'walk') return walkToast(pet, 52 * MINUTE, 0, isNight(now) ? new Date(now).setHours(15, 0, 0, 0) : now)
   if (scene === 'burp' || scene === 'slim') {
     return slimToast(pet, { at: now, isAuto: scene === 'burp', before: 167_000, after: 23_000 })
+  }
+  if (scene === 'coupon') {
+    const week = (await read($, limitsAtom))?.week ?? sampleWeek(now)
+    const view = couponOf(sampleCoupons(now), { five: null, week }, now)
+    return view === null ? null : `${portrait(pet)} ${seenToast(view)}`
   }
   if (scene !== 'belly') return null
   const held = await read($, bellyAtom)
@@ -1572,13 +1950,15 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'petdex',
-      description: '額度寵物圖鑑：抽過的貓狗、陣亡紀錄、保底（試抽／十連／肚子／預覽）',
-      argumentHint: '[試抽 | 十連 | 肚子 | 預覽 [0-100 | 深夜 | 散步 | 肚子 0-100 | 吐 | 減肥] [名字]]',
+      description: '額度寵物圖鑑：抽過的貓狗、陣亡紀錄、保底（試抽／十連／肚子／券／預覽）',
+      argumentHint: '[試抽 | 十連 | 肚子 | 券 | 預覽 [0-100 | 深夜 | 散步 | 肚子 0-100 | 吐 | 減肥 | 券] [名字]]',
     })
     if ((await $.store.get('folded')) === true) await update($, foldedAtom, () => true)
-    // A new conversation asks whose login it is again: a /login since may have changed it.
+    // A new conversation asks whose login it is again: a /login since may have changed it, and the resets shown are
+    // the account's once it is known.
     account = null
     askedAt = null
+    await update($, couponsAtom, () => null)
     // Readings kept before they were kept by account: whose they were is unknown.
     for (const key of ['limits', 'probe']) await $.store.delete(key)
     const usage = await $.session.usage()
@@ -1607,6 +1987,7 @@ export const register: Register = on => {
   on('session.attach', async ($, e, next) => {
     const result = await next(e)
     await serial(() => recall($)).catch(() => undefined)
+    await serial(() => remind($)).catch(() => undefined)
     $.clock.after(0, () => void probe($, PROBE_FRESH))
 
     return result
@@ -1616,6 +1997,7 @@ export const register: Register = on => {
     const result = await next(e)
     if (e.changed.includes('rateLimits')) {
       await serial(() => ingest($, e.rateLimits))
+      await serial(() => remind($)).catch(error => $.ui.log(`reset reminder failed: ${String(error)}`, { to: 'debug' }))
     }
     if (e.changed.includes('context')) {
       await serial(() => digest($, e.context))
@@ -1646,6 +2028,7 @@ export const register: Register = on => {
     }
     // An old reading is no start to count this turn's spending from.
     await serial(() => recall($))
+    await serial(() => remind($)).catch(error => $.ui.log(`reset reminder failed: ${String(error)}`, { to: 'debug' }))
     const limits = await read($, limitsAtom)
     const five = ageOf(limits, await $.clock.now()) !== null ? null : (limits?.five ?? null)
     turnStart = five === null ? null : { turnId: e.turnId, pct: five.pct, window: five.resetsAt }
@@ -1685,6 +2068,7 @@ export const register: Register = on => {
     if (verb === '試抽' || verb === 'try') return { text: trialText(1) }
     if (verb === '十連' || verb === '10') return { text: trialText(10) }
     if (verb === '肚子' || verb === 'belly') return { text: await bellyText($) }
+    if (verb === '券' || verb === '重置券' || verb === 'coupon') return { text: await couponText($) }
     if (verb === '預覽' || verb === 'preview') return { text: await startPreview($, rest) }
 
     return { text: await dexText($) }
@@ -1708,9 +2092,13 @@ export const register: Register = on => {
       shown === null
         ? (limits?.five ?? null)
         : { pct: shown.pct, resetsAt: now + (100 - shown.pct) * 3 * 60_000 + 20 * 60_000 }
-    const week = limits?.week ?? null
+    const week = limits?.week ?? (scene === 'coupon' ? sampleWeek(now) : null)
     const isOver = shown === null && five !== null && five.resetsAt !== null && now >= five.resetsAt
     const countdown = countdownOf(five, now)
+    // The account's free reset; a preview shows none but the one it acts out.
+    const coupons = scene === 'coupon' ? sampleCoupons(now) : shown === null ? await read($, couponsAtom) : null
+    const coupon = couponOf(coupons, { five, week }, now)
+    const mark = coupon === null ? null : couponMark(coupon, now)
 
     let face = portrait(pet)
     let say = (await read($, probingAtom)) ? '查額度中…' : '還沒拿到額度資料…跟我說句話吧'
@@ -1727,13 +2115,17 @@ export const register: Register = on => {
         face = faceOf(pet, stage, seed, e.props.isWorking)
         say = sayOf(pet, stage, seed, countdown)
       }
-      // The ghost stories and the death keep the floor; otherwise the pet may bring up something else.
-      // A quota preview shows the quota alone.
+      // The ghost stories and the death keep the floor; otherwise the pet may bring up something else, and with a
+      // free reset in hand it keeps on about that. A quota preview shows the quota alone.
       const aside = scene !== null ? sceneAside(scene, now, belly) : shown === null ? asideOf(now, activity, belly) : null
-      if (aside !== null && (stage === null || typeof stage === 'number')) {
-        const seed = Math.floor(now / (10 * MINUTE))
-        if (aside.kind === 'night') face = yawnOf(pet, seed)
-        say = asideLine(pet, aside, seed)
+      const isCalm = stage === null || typeof stage === 'number'
+      // What the pet brings up changes every ten minutes.
+      const slot = Math.floor(now / (10 * MINUTE))
+      if (aside !== null && isCalm) {
+        if (aside.kind === 'night') face = yawnOf(pet, slot)
+        say = asideLine(pet, aside, slot)
+      } else if (coupon !== null && isCalm) {
+        say = couponLine(pet, coupon, now, slot)
       }
     }
     const isCreepy = stage === 'h1' || stage === 'h2' || stage === 'h3' || stage === 'peek'
@@ -1764,6 +2156,7 @@ export const register: Register = on => {
           {five !== null && !isOver && <Text color={barColor(five.pct)}>{`5h ${pctText(five.pct)}`}</Text>}
           {five !== null && !isOver && <Text dimColor>{`· ${countdown} 後重置`}</Text>}
           {isOver && <Text dimColor>5h 已重置</Text>}
+          {mark !== null && <Text color={mark.color}>{mark.text}</Text>}
           <Button key={UNFOLD} label="展開" onPress={() => void setFolded($, false)} />
         </Box>,
       )
@@ -1791,6 +2184,7 @@ export const register: Register = on => {
                 <Text dimColor>5h</Text>
                 <Text color={barColor(five.pct)}>{bar(five.pct)}</Text>
                 <Text>{pctText(five.pct)}</Text>
+                {mark !== null && coupon?.target === 'five' && <Text color={mark.color}>{mark.text}</Text>}
                 <Text dimColor>{`· ${countdown} 後重置`}</Text>
               </Box>
             )}
@@ -1806,6 +2200,7 @@ export const register: Register = on => {
                   ))}
                 </Text>
                 <Text color={food.color}>{pctText(week.pct)}</Text>
+                {mark !== null && coupon?.target === 'week' && <Text color={mark.color}>{mark.text}</Text>}
                 {food.restock !== null && <Text dimColor>{`· ${food.restock}`}</Text>}
                 {food.text !== null && (
                   <Text dimColor wrap="truncate-end">

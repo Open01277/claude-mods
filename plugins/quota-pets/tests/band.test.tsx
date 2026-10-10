@@ -34,6 +34,31 @@ function textOf(node: unknown): string {
   return (element.children ?? []).map(textOf).join(' ')
 }
 
+// The server's answer with a free reset in it, as Claude Code's reset check reads it.
+function withCoupon(usage: string, grant: Record<string, unknown>): string {
+  const reset = { eligible: true, ineligible_reason: null, grants: [grant], next_grant_id: grant.id }
+  return JSON.stringify({ ...JSON.parse(usage), cedar_ember: reset })
+}
+
+// One reset, for the week and the 5 hours, that works only at a limit.
+function grant(left: number, endsAt: number): Record<string, unknown> {
+  const ends = new Date(endsAt).toISOString()
+  return { id: 'launch', label: '', resets_total: 1, resets_left: left, ends_at: ends, clears: ['five_hour', 'seven_day'], use_requires_limit: true }
+}
+
+// The reset's mark as drawn, and its color.
+function markOf(node: unknown): string | null {
+  if (node === null || typeof node !== 'object') return null
+  const { props, children = [] } = node as { props?: Record<string, unknown>; children?: unknown[] }
+  const [only] = children
+  if (children.length === 1 && typeof only === 'string' && only.startsWith('券')) return `${only} ${String(props?.color)}`
+  for (const child of children) {
+    const found = markOf(child)
+    if (found !== null) return found
+  }
+  return null
+}
+
 // The week's lane as drawn: each dot, Pac-Man and ghost with its color, or `dim`.
 function laneOf(node: unknown): string[] {
   if (node === null || typeof node !== 'object') return []
@@ -115,7 +140,8 @@ function world(on: On, rateLimits: SessionRateLimit[]) {
   on('http.fetch', ($, e) => {
     const { url, init } = e as { url: string; init?: { auth?: string } }
     state.fetches.push({ url, ...(init?.auth === undefined ? {} : { auth: init.auth }) })
-    const text = url.endsWith('/profile') ? state.profile : url.endsWith('/usage') ? state.usage : null
+    const { pathname } = new URL(url)
+    const text = pathname.endsWith('/profile') ? state.profile : pathname.endsWith('/usage') ? state.usage : null
     const res = { status: text === null ? 500 : 200, ok: text !== null, headers: {}, text: text ?? 'error' }
     return { value: res } as never
   })
@@ -671,26 +697,29 @@ test('a conversation opened with no fresh reading asks the server with its own l
   await $.session.start(START)
   await clock.advance(10)
 
-  // Whose login it is, then the quota, both with the session's own login.
+  // Whose login it is, then the quota and the free resets, both with the session's own login.
   expect(w.fetches).toEqual([
     { url: 'https://api.anthropic.com/api/oauth/profile', auth: 'handle-1' },
-    { url: 'https://api.anthropic.com/api/oauth/usage', auth: 'handle-1' },
+    { url: 'https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1', auth: 'handle-1' },
   ])
   const drawn = await band($)
   expect(drawn).toContain('37%')
   expect(drawn).toContain('飼料(週)')
   expect((store.get(`limits:${ACCOUNT}`) as { five: { pct: number } }).five.pct).toBe(37)
+  // An answer with no reset in it: none shows, and none is asked after again for hours.
+  expect(drawn).not.toContain('券')
+  expect((await $.command.run({ command: 'petdex', args: '券' } as never)).text).toContain('目前沒有重置券')
 
   // Come back to within two minutes, or another session starting meanwhile: the reading is fresh, nothing is asked.
   await $.session.attach({ surface: 'desktop', clientId: 'desktop:default' } as never)
   await $.session.start(START)
   await clock.advance(30_000)
-  expect(w.fetches.filter(one => one.url.endsWith('/usage'))).toHaveLength(1)
+  expect(w.fetches.filter(one => one.url.includes('/usage'))).toHaveLength(1)
 
   // Ten idle minutes later it asks again, for what claude.ai or another machine spent.
   w.usage = usageText(52, 20)
   await clock.advance(10 * MINUTE)
-  expect(w.fetches.filter(one => one.url.endsWith('/usage'))).toHaveLength(2)
+  expect(w.fetches.filter(one => one.url.includes('/usage'))).toHaveLength(2)
   expect(await band($)).toContain('52%')
   // Whose login it is, asked once a conversation: the two started here, and not again while idle.
   expect(w.fetches.filter(one => one.url.endsWith('/profile'))).toHaveLength(2)
@@ -734,4 +763,146 @@ test('with no login of its own to ask with, a session shows only its own answers
   await measure($, w.rateLimits)
   expect(await band($)).toContain('21%')
   expect([...store.keys()].filter(key => key.startsWith('limits'))).toEqual([])
+})
+
+test('a free reset in hand: the pet keeps on about eating the week through, and says when to press it', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  sharedStore(on, {})
+  const w = world(on, [])
+  // Three days into the week and 30% eaten: at this pace the food runs out a day after the restock in four days.
+  w.usage = withCoupon(usageText(20, 30, NOW + 2 * HOUR, NOW + 4 * DAY), grant(1, NOW + 5 * DAY))
+  await $.session.start(START)
+  await clock.advance(10)
+
+  // The week's food carries the reset, one character long.
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const tree = await draw($, surface)
+    const drawn = textOf(tree)
+    expect(drawn.slice(drawn.indexOf('飼料(週)')).replace(/\s+/g, '')).toBe('飼料(週)••ᗧᗣᗣᗣᗣᗣ30%券·週三18:00補貨')
+    expect(markOf(tree)).toBe('券 magenta')
+  }
+  // Opening a conversation is still quiet.
+  expect(w.shown.filter(text => !text.startsWith('log:'))).toEqual([])
+
+  // The pet talks of nothing else, a new line every ten minutes: now and then the reset itself, otherwise how much
+  // faster the food must go, 70% in four days.
+  const said: string[] = []
+  for (let index = 0; index < 6; index++) {
+    said.push(lineOf(await band($)))
+    await clock.advance(10 * MINUTE)
+  }
+  console.log(said.join('\n'))
+  expect(said.every(line => /重置券|吃/.test(line))).toBe(true)
+  expect(said.some(line => line.includes('每天要吃 18%'))).toBe(true)
+
+  // Their turn: the reset is told once, there.
+  await turn($, clock, 't1', 1)
+  await turn($, clock, 't2', 1)
+  const seen = w.shown.filter(text => text.includes('發現重置券（10/8 到期）！把這週的飼料吃光再去按'))
+  expect(seen).toHaveLength(1)
+  expect(w.shown.filter(text => !text.startsWith('log:'))).toHaveLength(1)
+
+  const info = (await $.command.run({ command: 'petdex', args: '券' } as never)).text
+  expect(info).toContain('・重置券：剩 1/1 次｜10/8 18:00 到期（還有 4天22時）｜會清掉：5 小時、每週｜要撞到上限才能按')
+  expect(info).toContain('這週飼料吃了 30%，週三 18:00 補貨')
+  expect(info).toContain('照這速度吃不完：每天要吃 18%才吃得光')
+  expect(info).toContain('設定 → 用量 →「Reset for free」')
+  console.log(info)
+  expect((await $.command.run({ command: 'petdex', args: '' } as never)).text).toContain('重置券 ×1（10/8 到期）')
+
+  // The week eaten through: time to press it, said once however many answers follow.
+  w.rateLimits = limits(40, 100, NOW + 2 * HOUR, NOW + 4 * DAY)
+  await measure($, w.rateLimits)
+  await measure($, w.rateLimits)
+  expect(w.shown.filter(text => text.includes('飼料吃光了！快去 設定 → 用量 按「Reset for free」用掉重置券（10/8 到期）'))).toHaveLength(1)
+  const pressing = await draw($)
+  expect(markOf(pressing)).toBe('券 error')
+  expect(lineOf(textOf(pressing))).toMatch(/按/)
+
+  // Pressed on claude.ai: the next answers say none is left and the week is new; the next turn cheers, and the pet
+  // goes back to its own lines.
+  w.usage = withCoupon(usageText(5, 0, NOW + 2 * HOUR, NOW + 4 * DAY), grant(0, NOW + 5 * DAY))
+  w.rateLimits = limits(5, 0, NOW + 2 * HOUR, NOW + 4 * DAY)
+  await measure($, w.rateLimits)
+  await clock.advance(6 * MINUTE)
+  await turn($, clock, 't3', 1)
+  expect(w.shown.filter(text => text.includes('重置券用掉了！新的一袋飼料到手'))).toHaveLength(1)
+  const after = await draw($)
+  expect(markOf(after)).toBeNull()
+  expect(lineOf(textOf(after))).not.toMatch(/重置券/)
+  console.log(w.shown.join('\n'))
+})
+
+test('the 5 hours running out with a reset for the week too: keep it until the week is eaten through', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  sharedStore(on, {})
+  const w = world(on, [])
+  w.usage = withCoupon(usageText(80, 40), grant(1, NOW + 5 * DAY))
+  await $.session.start(START)
+  await clock.advance(10)
+
+  w.rateLimits = limits(100, 40)
+  await measure($, w.rateLimits)
+  const death = w.shown.filter(text => text.includes('陣亡了'))
+  expect(death).toHaveLength(1)
+  expect(death[0]).toContain('｜重置券先別按：週飼料還剩 60%，吃光再按才划算')
+})
+
+test("a new week with the reset still in hand, then the reset's last day", { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  sharedStore(on, {})
+  const w = world(on, [])
+  // The week restocks in ten hours; the reset runs out in two days, before the restock after.
+  w.usage = withCoupon(usageText(10, 70, NOW + 2 * HOUR, NOW + 10 * HOUR), grant(1, NOW + 2 * DAY))
+  await $.session.start(START)
+  await clock.advance(10)
+  await turn($, clock, 't1', 1)
+  expect(w.shown.filter(text => text.includes('發現重置券'))).toHaveLength(1)
+
+  // A new bag: this week is the reset's last.
+  await clock.advance(11 * HOUR)
+  w.usage = withCoupon(usageText(3, 1, NOW + 13 * HOUR, NOW + 10 * HOUR + 7 * DAY), grant(1, NOW + 2 * DAY))
+  w.rateLimits = limits(3, 1, NOW + 13 * HOUR, NOW + 10 * HOUR + 7 * DAY)
+  await measure($, w.rateLimits)
+  // Two days less the eleven hours and the minute of the turn: 36h59m.
+  expect(w.shown.filter(text => text.includes('新的一週，新的一袋！手上還有重置券（10/5 到期）：1天12時內吃光就去按，不然就浪費了'))).toHaveLength(1)
+  // A new bag and its last days: the pet says so.
+  const said: string[] = []
+  for (let index = 0; index < 6; index++) {
+    said.push(lineOf(await band($)))
+    await clock.advance(10 * MINUTE)
+  }
+  console.log(said.join('\n'))
+  expect(said.some(line => /過期|到期/.test(line))).toBe(true)
+  expect(said.some(line => /新的一袋|補貨了/.test(line))).toBe(true)
+
+  // Its last day: once, at their turn.
+  await clock.advance(13 * HOUR)
+  await $.turn.start({ text: 'go', turnId: 't2' } as never)
+  await $.turn.start({ text: 'go', turnId: 't3' } as never)
+  const last = w.shown.filter(text => text.includes('重置券剩 22h59m就過期了，這週飼料吃了 1%：要吃光才按得了，衝啊！'))
+  expect(last).toHaveLength(1)
+  expect(markOf(await draw($))).toBe('券 warning')
+  console.log(w.shown.join('\n'))
+})
+
+test('/petdex 預覽 券 acts out a reset in hand', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on)
+  const w = world(on, limits(10, 20))
+  await $.session.start(START)
+  expect(markOf(await draw($))).toBeNull()
+
+  const said = await $.command.run({ command: 'petdex', args: '預覽 券 柴犬' } as never)
+  expect(said.text).toContain('預覽「重置券」一分鐘')
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const tree = await draw($, surface)
+    const drawn = textOf(tree)
+    expect(drawn).toContain('柴犬')
+    expect(drawn).toContain('（預覽中）')
+    expect(markOf(tree)).toBe('券 magenta')
+    expect(lineOf(drawn)).toMatch(/重置券|吃/)
+    console.log(drawn)
+  }
+  expect(w.shown.filter(text => text.startsWith('【預覽】') && text.includes('發現重置券'))).toHaveLength(1)
 })
