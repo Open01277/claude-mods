@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { USAGE_URL, accountOf, clientHeaders, couponsOf, usageOf } from '../hooks/usage'
+import { USAGE_URL, accountOf, couponsOf, usageOf } from '../hooks/usage'
 
 test('the quota reads from the server answer, its resets in UTC', () => {
   const text = JSON.stringify({
@@ -86,13 +86,4 @@ test('whose quota: the account and the organization it spends in, both or none',
   expect(accountOf(JSON.stringify({ account: { uuid: 'a' }, organization: { uuid: 'o' } }))).toBe('a/o')
   expect(accountOf(JSON.stringify({ account: { uuid: 'a' } }))).toBeNull()
   expect(accountOf('not json')).toBeNull()
-})
-
-test('asks as Claude Code asks: its app and its user agent, the entrypoint it was started from or cli', () => {
-  expect(clientHeaders('2.1.295', 'claude-desktop')).toMatchObject({
-    'x-app': 'cli',
-    'user-agent': 'claude-cli/2.1.295 (external, claude-desktop)',
-  })
-  expect(clientHeaders('2.1.295', undefined)['user-agent']).toBe('claude-cli/2.1.295 (external, cli)')
-  expect(clientHeaders('2.1.295', '')['user-agent']).toBe('claude-cli/2.1.295 (external, cli)')
 })

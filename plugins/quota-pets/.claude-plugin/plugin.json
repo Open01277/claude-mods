@@ -1,6 +1,6 @@
 {
   "name": "quota-pets",
-  "version": "0.10.3",
+  "version": "0.10.4",
   "description": "額度寵物扭蛋：每個對話抽一隻顏文字貓或狗，額度快用完會講鬼故事、用完會陣亡、重置後轉生；context 是牠的肚子（/petdex 肚子 看牠吃了什麼），連續寫太久會吵著散步，半夜會催你睡；手上有重置券時會一直催你把這週的飼料吃光再去按（/petdex 券）",
   "types": "./types/index.d.ts"
 }

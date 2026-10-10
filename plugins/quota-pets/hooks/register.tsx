@@ -14,7 +14,7 @@ import type {
   QuotaPetsScene,
 } from '../types'
 import { biggest, categoryName, mealsOf } from './meals'
-import { PROFILE_URL, USAGE_URL, accountOf, clientHeaders, couponsOf, usageOf } from './usage'
+import { OAUTH_HEADERS, PROFILE_URL, USAGE_URL, accountOf, couponsOf, usageOf } from './usage'
 import type { Meal } from './meals'
 
 type Rarity = 'N' | 'R' | 'SR' | 'SSR' | 'UR'
@@ -1064,13 +1064,10 @@ function couponsFrom(value: unknown): QuotaPetsCoupons | null {
   return typeof coupons.at === 'number' && Array.isArray(coupons.grants) ? (coupons as QuotaPetsCoupons) : null
 }
 
-// The resets were asked for recently enough: within minutes while one is held, within hours while none is. An answer
-// refused for the surface asked from (an ask without Claude Code's headers, as before 0.10.2, or from a session not
-// yet restarted onto them) says nothing of the account, so it holds only minutes too.
+// The resets were asked for recently enough: within minutes while one is held, within hours while none is.
 function isCouponFresh(coupons: QuotaPetsCoupons | null, now: number): boolean {
   if (coupons === null) return false
-  const isBrief = coupons.reason === 'surface' || coupons.grants.some(grant => isLive(grant, now))
-  return now - coupons.at < (isBrief ? COUPON_FRESH : COUPON_IDLE)
+  return now - coupons.at < (coupons.grants.some(grant => isLive(grant, now)) ? COUPON_FRESH : COUPON_IDLE)
 }
 
 // The reset /petdex 預覽 券 acts out, for the week and the 5 hours with five days left, and the week it goes with
@@ -1429,17 +1426,12 @@ let account: string | null = null
 // When the server was last asked, so one that does not answer is asked again only after PROBE_GAP.
 let askedAt: number | null = null
 
-// The headers to ask with, as Claude Code itself asks from this session (clientHeaders).
-async function askHeaders($: EngineInterface): Promise<Record<string, string>> {
-  return clientHeaders((await $.session.version()).version, await $.env.get('CLAUDE_CODE_ENTRYPOINT'))
-}
-
 async function whose($: EngineInterface, handle: string): Promise<string | null> {
   if (account !== null) return account
   const now = await $.clock.now()
   if (askedAt !== null && now - askedAt >= 0 && now - askedAt < PROBE_GAP) return null
   askedAt = now
-  const res = await $.http.fetch(PROFILE_URL, { auth: handle, headers: await askHeaders($) })
+  const res = await $.http.fetch(PROFILE_URL, { auth: handle, headers: OAUTH_HEADERS })
   account = res.ok ? accountOf(res.text) : null
   return account
 }
@@ -1495,7 +1487,7 @@ async function probe($: EngineInterface, fresh: number): Promise<void> {
     if (typeof last?.at === 'number' && now - last.at >= 0 && now - last.at < PROBE_GAP) return
     await $.store.set(`probe:${who}`, { at: now })
     await update($, probingAtom, () => true)
-    const res = await $.http.fetch(USAGE_URL, { auth: auth.handle, headers: await askHeaders($) })
+    const res = await $.http.fetch(USAGE_URL, { auth: auth.handle, headers: OAUTH_HEADERS })
     const found = res.ok ? usageOf(res.text) : null
     if (found === null) return
     const at = await $.clock.now()

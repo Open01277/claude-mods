@@ -102,7 +102,7 @@ function world(on: On, rateLimits: SessionRateLimit[]) {
     // What the server answers for the quota and the account; null: it fails.
     usage: null as string | null,
     profile: PROFILE as string | null,
-    fetches: [] as { url: string; auth?: string; headers?: Record<string, string> }[],
+    fetches: [] as { url: string; auth?: string }[],
     commands: [] as string[],
     shown: [] as string[],
   }
@@ -139,12 +139,9 @@ function world(on: On, rateLimits: SessionRateLimit[]) {
     return state.beneath === null ? <Box /> : <Text>{state.beneath}</Text>
   })
   on('session.authorize', () => ({ value: state.login === null ? null : { handle: state.login, kind: 'bearer' } }) as never)
-  // The engine Claude Code runs as, and the desktop app it was started from.
-  on('session.version', () => ({ value: { version: '2.1.295', base: '2.1.295' } }) as never)
-  on('env.get', ($, e) => ({ value: (e as { name: string }).name === 'CLAUDE_CODE_ENTRYPOINT' ? 'claude-desktop' : undefined }) as never)
   on('http.fetch', ($, e) => {
-    const { url, init } = e as { url: string; init?: { auth?: string; headers?: Record<string, string> } }
-    state.fetches.push({ url, ...(init?.auth === undefined ? {} : { auth: init.auth, headers: init.headers }) })
+    const { url, init } = e as { url: string; init?: { auth?: string } }
+    state.fetches.push({ url, ...(init?.auth === undefined ? {} : { auth: init.auth }) })
     const { pathname } = new URL(url)
     const text = pathname.endsWith('/profile') ? state.profile : pathname.endsWith('/usage') ? state.usage : null
     const res = { status: text === null ? 500 : 200, ok: text !== null, headers: {}, text: text ?? 'error' }
@@ -702,17 +699,10 @@ test('a conversation opened with no fresh reading asks the server with its own l
   await $.session.start(START)
   await clock.advance(10)
 
-  // Whose login it is, then the quota and the free resets, both with the session's own login, and saying they ask as
-  // Claude Code does: without it the server answers that no free reset is offered on this surface.
-  const headers = {
-    'anthropic-beta': 'oauth-2025-04-20',
-    accept: 'application/json',
-    'x-app': 'cli',
-    'user-agent': 'claude-cli/2.1.295 (external, claude-desktop)',
-  }
+  // Whose login it is, then the quota and the free resets, both with the session's own login.
   expect(w.fetches).toEqual([
-    { url: 'https://api.anthropic.com/api/oauth/profile', auth: 'handle-1', headers },
-    { url: 'https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1', auth: 'handle-1', headers },
+    { url: 'https://api.anthropic.com/api/oauth/profile', auth: 'handle-1' },
+    { url: 'https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1', auth: 'handle-1' },
   ])
   const drawn = await band($)
   expect(drawn).toContain('37%')
@@ -736,28 +726,6 @@ test('a conversation opened with no fresh reading asks the server with its own l
   // Whose login it is, asked once a conversation: the two started here, and not again while idle.
   expect(w.fetches.filter(one => one.url.endsWith('/profile'))).toHaveLength(2)
   expect(w.shown.filter(text => !text.startsWith('log:'))).toEqual([])
-})
-
-test('an answer refused for the surface asked from is asked again in minutes, one with no reset only in hours', async ($, on) => {
-  const clock = mock.clock(on, { now: NOW })
-  const limits = { five: { pct: 20, resetsAt: NOW + 2 * HOUR }, week: { pct: 30, resetsAt: NOW + 4 * DAY }, at: NOW }
-  const refused = { grants: [], eligible: false, reason: 'surface', at: NOW - 10 * MINUTE }
-  const store = sharedStore(on, { [`limits:${ACCOUNT}`]: limits, [`coupons:${ACCOUNT}`]: refused })
-  const w = world(on, [])
-  w.usage = usageText(20, 30)
-  await $.session.start(START)
-  await clock.advance(10)
-  // The quota just read, but the resets were refused as asked by an older version: asked again, with the headers.
-  expect(w.fetches.filter(one => one.url.includes('/usage'))).toHaveLength(1)
-  expect((store.get(`coupons:${ACCOUNT}`) as { reason: string | null }).reason).toBeNull()
-
-  // Truly none to give: not asked after again while the quota stays fresh.
-  store.set(`limits:${ACCOUNT}`, { ...limits, at: NOW + 20 * MINUTE })
-  store.set(`coupons:${ACCOUNT}`, { grants: [], eligible: false, reason: 'no_grant', at: NOW + 10 * MINUTE })
-  await clock.advance(20 * MINUTE)
-  await $.session.start(START)
-  await clock.advance(10)
-  expect(w.fetches.filter(one => one.url.includes('/usage'))).toHaveLength(1)
 })
 
 test("another account's reading never shows: the terminal's claude logged in elsewhere, or readings kept before accounts", async ($, on) => {

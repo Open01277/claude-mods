@@ -14,13 +14,6 @@ export const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage?cedar_ember=
 export const PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
 export const OAUTH_HEADERS = { 'anthropic-beta': 'oauth-2025-04-20', accept: 'application/json' }
 
-// The headers Claude Code's own reads carry, saying which client asks: without them the server takes the ask for one
-// from no surface it offers free resets on, and answers `ineligible_reason: "surface"` with none, though the account
-// holds one. `entrypoint` is CLAUDE_CODE_ENTRYPOINT (`claude-desktop` in the desktop app), `cli` when unset.
-export function clientHeaders(version: string, entrypoint: string | undefined): Record<string, string> {
-  return { ...OAUTH_HEADERS, 'x-app': 'cli', 'user-agent': `claude-cli/${version} (external, ${entrypoint || 'cli'})` }
-}
-
 function parse(text: string): unknown {
   try {
     return JSON.parse(text)
