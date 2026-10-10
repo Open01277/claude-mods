@@ -1064,10 +1064,13 @@ function couponsFrom(value: unknown): QuotaPetsCoupons | null {
   return typeof coupons.at === 'number' && Array.isArray(coupons.grants) ? (coupons as QuotaPetsCoupons) : null
 }
 
-// The resets were asked for recently enough: within minutes while one is held, within hours while none is.
+// The resets were asked for recently enough: within minutes while one is held, within hours while none is. An answer
+// refused for the surface asked from (an ask without Claude Code's headers, as before 0.10.2, or from a session not
+// yet restarted onto them) says nothing of the account, so it holds only minutes too.
 function isCouponFresh(coupons: QuotaPetsCoupons | null, now: number): boolean {
   if (coupons === null) return false
-  return now - coupons.at < (coupons.grants.some(grant => isLive(grant, now)) ? COUPON_FRESH : COUPON_IDLE)
+  const isBrief = coupons.reason === 'surface' || coupons.grants.some(grant => isLive(grant, now))
+  return now - coupons.at < (isBrief ? COUPON_FRESH : COUPON_IDLE)
 }
 
 // The reset /petdex 預覽 券 acts out, for the week and the 5 hours with five days left, and the week it goes with

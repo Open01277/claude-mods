@@ -738,6 +738,28 @@ test('a conversation opened with no fresh reading asks the server with its own l
   expect(w.shown.filter(text => !text.startsWith('log:'))).toEqual([])
 })
 
+test('an answer refused for the surface asked from is asked again in minutes, one with no reset only in hours', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const limits = { five: { pct: 20, resetsAt: NOW + 2 * HOUR }, week: { pct: 30, resetsAt: NOW + 4 * DAY }, at: NOW }
+  const refused = { grants: [], eligible: false, reason: 'surface', at: NOW - 10 * MINUTE }
+  const store = sharedStore(on, { [`limits:${ACCOUNT}`]: limits, [`coupons:${ACCOUNT}`]: refused })
+  const w = world(on, [])
+  w.usage = usageText(20, 30)
+  await $.session.start(START)
+  await clock.advance(10)
+  // The quota just read, but the resets were refused as asked by an older version: asked again, with the headers.
+  expect(w.fetches.filter(one => one.url.includes('/usage'))).toHaveLength(1)
+  expect((store.get(`coupons:${ACCOUNT}`) as { reason: string | null }).reason).toBeNull()
+
+  // Truly none to give: not asked after again while the quota stays fresh.
+  store.set(`limits:${ACCOUNT}`, { ...limits, at: NOW + 20 * MINUTE })
+  store.set(`coupons:${ACCOUNT}`, { grants: [], eligible: false, reason: 'no_grant', at: NOW + 10 * MINUTE })
+  await clock.advance(20 * MINUTE)
+  await $.session.start(START)
+  await clock.advance(10)
+  expect(w.fetches.filter(one => one.url.includes('/usage'))).toHaveLength(1)
+})
+
 test("another account's reading never shows: the terminal's claude logged in elsewhere, or readings kept before accounts", async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const other = { five: { pct: 0, resetsAt: NOW + 2 * HOUR }, week: { pct: 13, resetsAt: NOW + 6 * DAY }, at: NOW }
