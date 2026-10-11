@@ -88,6 +88,8 @@ declare module 'claude-code' {
       view: ConvoBoardView | null
       // The rows whose answer is unfolded, by conversation id.
       open: Record<string, boolean>
+      // The board is open in this conversation: while it is not, the band's button stands in for it.
+      isOpen: boolean
     }
   }
 }

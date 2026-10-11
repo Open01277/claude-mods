@@ -171,8 +171,8 @@ test('a conversation tells the boards it runs, waits on the person, and ended wh
   const w = world(on, $)
   await $.session.start(START)
   await clock.settle()
-  // On screen in the desktop: the board opens beside it by itself.
-  expect(w.opened).toEqual([PANE])
+  // On screen in the desktop with no other conversation about: an empty board would only take room.
+  expect(w.opened).toEqual([])
   expect(mine(w)).toMatchObject({ id: ME, title: '儀表板設計', link: link(ME), isDesktop: true, phase: 'idle' })
 
   await $.turn.start({ text: '幫我推上去\n然後開 PR', turnId: 't1' } as never)
@@ -334,7 +334,10 @@ test('once the board holds the keys, Tab walks it without jumping, and a click s
 test('a conversation whose board the person closed opens it no more by itself, until the command opens it', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, { OS: 'Windows_NT' })
-  const w = world(on, $, { [`closed:${ME}`]: true })
+  const w = world(on, $, {
+    [`closed:${ME}`]: true,
+    'conv:local_a': entry('local_a', { phase: 'running', since: NOW, turnAt: NOW, doing: '讀 a.ts' }),
+  })
   await $.session.start(START)
   await clock.settle()
   expect(w.opened).toEqual([])
@@ -376,7 +379,7 @@ test('知道了 puts an unseen card away on every board, until that conversation
     'conv:cli-x': entry('cli-x', { isDesktop: false, link: null, phase: 'done', since: NOW - 12 * MINUTE, outcome: 'failed', isSeen: false }),
     'conv:local_r': entry('local_r', { phase: 'running', since: NOW - MINUTE, turnAt: NOW - MINUTE, doing: '執行 npm test' }),
   })
-  w.sessions = [{ sessionId: 'local_r', title: '跑測試', cwd: 'D:\程式\Stock', link: link('local_r'), isRunning: true }]
+  w.sessions = [{ sessionId: 'local_r', title: '跑測試', cwd: 'D:\\程式\\Stock', link: link('local_r'), isRunning: true }]
   await $.session.start(START)
   await clock.settle()
 
@@ -395,4 +398,71 @@ test('知道了 puts an unseen card away on every board, until that conversation
   w.kept.set('conv:cli-x', entry('cli-x', { isDesktop: false, link: null, phase: 'done', since: NOW + MINUTE, answer: '好了', outcome: 'answered', isSeen: false, beat: NOW + MINUTE }))
   await clock.advance(5000)
   expect(await drawn($)).toContain('好了')
+})
+
+const BAND_PROPS = { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 100 } as const
+
+test('a closed board leaves a button above the prompt while a conversation waits on the person or ended unseen', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.env(on, { OS: 'Windows_NT' })
+  const w = world(on, $, {
+    [`closed:${ME}`]: true,
+    'conv:local_r': entry('local_r', { phase: 'running', since: NOW, turnAt: NOW, doing: '讀 a.ts' }),
+  })
+  // Another plugin's band beneath this one, as quota-pets draws.
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>U•ﻌ•U 單身狗</Text>
+  })
+  const band = (surface: (typeof SURFACES)[number] = 'desktop') =>
+    $.ui.mount({ plugin: 'convo-board', surface, component: 'AbovePrompt', props: BAND_PROPS as never })
+  await $.session.start(START)
+  await clock.settle()
+
+  // Only one that runs: nothing needs the person, no button.
+  let ui = await band()
+  expect(await ui.find({ key: 'board' })).toBeUndefined()
+  expect(textOf(await ui.drawn())).toContain('單身狗')
+  await ui.unmount()
+
+  w.kept.set('conv:local_w', entry('local_w', { phase: 'waiting', since: NOW, doing: '問你問題' }))
+  w.kept.set('conv:local_u', entry('local_u', { phase: 'done', since: NOW, answer: '好了', outcome: 'answered', isSeen: false }))
+  w.sessions = ['local_r', 'local_w', 'local_u'].map(id => ({ sessionId: id, title: id, cwd: CWD, link: link(id), isRunning: id !== 'local_u' }))
+  await clock.advance(7000)
+  // Closed by hand: it stays closed, and the button counts what needs the person.
+  expect(w.opened).toEqual([])
+  ui = await band()
+  const text = textOf(await ui.drawn())
+  expect(text).toContain('單身狗')
+  expect(text).toContain('看板（2）')
+  expect(text.indexOf('單身狗')).toBeLessThan(text.indexOf('看板（2）'))
+  await ui.unmount()
+  // The terminal has the command: the band stays the other plugin's.
+  ui = await band('terminal')
+  expect(await ui.find({ key: 'board' })).toBeUndefined()
+  await ui.unmount()
+
+  ui = await band()
+  await ui.press({ key: 'board' })
+  await clock.settle()
+  expect(w.opened).toEqual([PANE])
+  expect(w.kept.has(`closed:${ME}`)).toBe(false)
+  // Open now: no button.
+  expect(await ui.find({ key: 'board' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('an empty board stays shut; it opens by itself once another conversation is about', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.env(on, { OS: 'Windows_NT' })
+  const w = world(on, $)
+  await $.session.start(START)
+  await clock.advance(7000)
+  expect(w.opened).toEqual([])
+
+  w.kept.set('conv:local_a', entry('local_a', { phase: 'running', since: NOW, turnAt: NOW, doing: '讀 a.ts' }))
+  w.sessions = [{ sessionId: 'local_a', title: '另一個', cwd: CWD, link: link('local_a'), isRunning: true }]
+  await clock.advance(7000)
+  expect(w.opened).toEqual([PANE])
+  expect(await drawn($)).toContain('讀 a.ts')
 })

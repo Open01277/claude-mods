@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, Timer } from 'claude-code'
+import type { EngineInterface, Register, Timer, UiOpenResult } from 'claude-code'
 
 import type { ConvoBoardEntry, ConvoBoardMe, ConvoBoardRow, ConvoBoardSection, ConvoBoardSession } from '../types'
 import { buildView, cut, describeAsk, describeTool, firstLine, safeLink } from './board'
@@ -17,6 +17,8 @@ const SEEN = 'seen:'
 const GO = 'go:'
 const PEEK = 'peek:'
 const OK = 'ok:'
+// The band's button that opens the board, on the desktop.
+const BOARD = 'board'
 // The desktop's own tools: who this conversation is, and every conversation it keeps.
 const DESKTOP = 'ccd_session_mgmt'
 
@@ -24,6 +26,7 @@ const meAtom = atom({ plugin: 'convo-board', key: 'me' } as const, null)
 const entryAtom = atom({ plugin: 'convo-board', key: 'entry' } as const, null)
 const viewAtom = atom({ plugin: 'convo-board', key: 'view' } as const, null)
 const openAtom = atom({ plugin: 'convo-board', key: 'open' } as const, {})
+const isOpenAtom = atom({ plugin: 'convo-board', key: 'isOpen' } as const, false)
 
 // A sign of life this often; past STALE_MS without one, a board takes the conversation for stopped.
 const BEAT_MS = 30_000
@@ -228,12 +231,18 @@ async function entries($: EngineInterface, now: number): Promise<ConvoBoardEntry
   return found
 }
 
-// Draws the board afresh from every conversation's line: only where someone looks at it, unless asked.
+// Whether the board is open here, for the band's button to read.
+async function syncOpen($: EngineInterface): Promise<boolean> {
+  const isOpen = (await $.ui.panes()).some(pane => pane.id === PANE)
+  if ((await read($, isOpenAtom)) !== isOpen) await update($, isOpenAtom, () => isOpen)
+  return isOpen
+}
+
+// Draws the board afresh from every conversation's line: only where someone looks at this conversation, unless
+// asked. With the board closed too: the band's button counts from it, and the board opens once there is something on
+// it.
 async function refresh($: EngineInterface, isForced: boolean): Promise<void> {
-  if (!isForced) {
-    if (!(await isLooked($))) return
-    if (!(await $.ui.panes()).some(pane => pane.id === PANE)) return
-  }
+  if (!isForced && !(await isLooked($))) return
   const now = await $.clock.now()
   const me = await read($, meAtom)
   if (me?.isDesktop === true && (sessions === null || now - listedAt >= LIST_MS)) {
@@ -249,12 +258,16 @@ async function refresh($: EngineInterface, isForced: boolean): Promise<void> {
   }
   const view = buildView(found, me?.isDesktop === true ? sessions : null, me?.id ?? '', now, dismissed)
   const text = JSON.stringify(view)
-  if (text === shown) return
-  shown = text
-  await update($, viewAtom, () => view)
+  if (text !== shown) {
+    shown = text
+    await update($, viewAtom, () => view)
+  }
+  const isOpen = await syncOpen($)
+  if (!isForced && !isOpen && view.rows.length > 0) await autoOpen($)
 }
 
-// The desktop opens the board beside each conversation it shows, unless the person closed it there.
+// The desktop opens the board beside each conversation it shows once there is something on it, unless the person
+// closed it there: an empty board only takes room.
 async function autoOpen($: EngineInterface): Promise<void> {
   const me = await read($, meAtom)
   if (me === null || !me.isDesktop) return
@@ -262,7 +275,19 @@ async function autoOpen($: EngineInterface): Promise<void> {
   if ((await $.store.get(`${CLOSED}${me.id}`)) === true) return
   if ((await $.ui.panes()).some(pane => pane.id === PANE)) return
   await refresh($, true)
+  if (((await read($, viewAtom))?.rows.length ?? 0) === 0) return
   await $.ui.open({ id: PANE, title: TITLE })
+  await syncOpen($)
+}
+
+// Opened by the person (the command, the band's button): it opens by itself here again from now on.
+async function openBoard($: EngineInterface): Promise<UiOpenResult> {
+  const me = await read($, meAtom)
+  if (me !== null) await $.store.delete(`${CLOSED}${me.id}`)
+  await refresh($, true)
+  const opened = await $.ui.open({ id: PANE, title: TITLE })
+  await syncOpen($)
+  return opened
 }
 
 async function openerOf($: EngineInterface): Promise<readonly string[]> {
@@ -498,19 +523,50 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: COMMAND }, async $ => {
-    const me = await read($, meAtom)
-    if (me !== null) await $.store.delete(`${CLOSED}${me.id}`)
-    await refresh($, true)
-    const opened = await $.ui.open({ id: PANE, title: TITLE })
+    const opened = await openBoard($)
 
     return { text: opened.isPlaced ? '看板打開了。' : `看板等畫面夠寬就會出現：${opened.reason}` }
   })
 
-  // Closed by the person's hand: this conversation opens it no more by itself, until the command opens it again.
+  // Closed by the person's hand: this conversation opens it no more by itself, until the command or the band's button
+  // opens it again.
   on('ui.close', { id: PANE }, async ($, e, next) => {
     const result = await next(e)
     const me = await read($, meAtom)
     if (e.origin.kind === 'person' && me !== null) await $.store.set(`${CLOSED}${me.id}`, true)
+    await syncOpen($)
+
+    return result
+  })
+
+  // On the desktop, while the board is closed and a conversation waits on the person or ended unseen, a small button
+  // above the prompt opens it, to the right of what other plugins draw there. Ones that only run need nothing.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const beneath = await next(e)
+    if (e.surface !== 'desktop' || e.props.hasSurvey) return beneath
+    if (await read($, isOpenAtom)) return beneath
+    const count = ((await read($, viewAtom))?.rows ?? []).filter(row => row.section !== 'running').length
+    if (count === 0) return beneath
+
+    const { Box, Button } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="row" alignItems="flex-start" columnGap={2}>
+        <Box flexDirection="column" flexGrow={1} flexShrink={1}>
+          {beneath}
+        </Box>
+        <Button key={BOARD} label={`${TITLE}（${count}）`} onPress={() => void openBoard($)} />
+      </Box>
+    )
+  })
+
+  // While the prompt holds the keys, a click on the desktop band only moves its focus ring onto the button, and the
+  // press waits for a second click. Opening the board harms nothing, so the ring landing there by the person's hand
+  // opens it too.
+  on('ui.focus', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const result = await next(e)
+    if (result.deny === undefined && e.plugin === PLUGIN && e.element === BOARD && e.origin.kind === 'person') {
+      $.clock.after(0, () => void openBoard($).catch(() => undefined))
+    }
 
     return result
   })
