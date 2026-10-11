@@ -14,7 +14,7 @@ import { ALLOW, gitOpsOf, isAllowed, parseStatus, takesFile } from './clash'
 import type { GitOp, Shell } from './clash'
 import { diffText, isBinary, piecesOf, unapply } from './diff'
 import type { Hunk } from './diff'
-import { gitArgv, isLeftover, parseRaw, parseTree, sameText, withEol } from './git'
+import { gitArgv, isLeftover, parseRaw, parseTree, parseWorktrees, sameText, withEol } from './git'
 import { absolute, fromMsys, isWindowsPath, keyOf, normalize, relOf } from './paths'
 
 const PLUGIN = 'convo-diff'
@@ -36,9 +36,13 @@ const PRESS_GAP_MS = 600
 // The desktop may draw the pane holding the keys before the ring move of the click that gave them arrives: a move
 // this soon after is still that click.
 const TAKE_MS = 500
-// A drawn tree is refused past 100,000 characters serialized: the diffs get most of it.
-const RENDER_BUDGET = 60_000
+// A drawn tree is refused past 100,000 characters serialized: the pane keeps under this, a margin for what the
+// engine's serializing adds. The rows of the files leave at least DIFF_ROOM to the diffs while one is open.
+const RENDER_BUDGET = 85_000
+const DIFF_ROOM = 30_000
 const MAX_FILES_DRAWN = 200
+// The line naming the committed files is drawn cut at its end: no more of it than a wide pane shows.
+const COMMITTED_CHARS = 1000
 const TOOL_BUDGET = 40_000
 // The store holds 4 MiB of JSON in all, across every conversation it keeps.
 const STORE_BUDGET = 3 * 1024 * 1024
@@ -77,6 +81,11 @@ type BashEdit = { path: string; hunks: Hunk[]; isCreated: boolean; isDeleted: bo
 // know which files are its and how to name it: its desktop session and title.
 type Kept = { v: 1; at: number; track: ConvoDiffTrack; session?: string | null; title?: string | null }
 
+// A drawn tree's size as the engine counts it, near enough: its JSON.
+function sizeOf(tree: unknown): number {
+  return JSON.stringify(tree)?.length ?? 0
+}
+
 function reasonOf(error: unknown): string {
   const text = error instanceof Error ? error.message : String(error)
   return (text.split('\n')[0] ?? '').slice(0, 120)
@@ -101,6 +110,53 @@ async function topOf($: EngineInterface): Promise<string> {
   isGit = isAbove
   topCache = isAbove ? found : root
   return topCache
+}
+
+// A work tree of the repo: the one the session started in (label null: its files need no name), or another one
+// (`git worktree add`), labelled by its branch. A file this conversation changed in any of them is its own.
+type Tree = { top: string; label: string | null }
+
+let treesCache: Tree[] | null = null
+
+// The session's tree first, then the others. A failed listing keeps the last one.
+async function treesOf($: EngineInterface, isFresh = false): Promise<Tree[]> {
+  if (treesCache !== null && !isFresh) return treesCache
+  const top = await topOf($)
+  const main: Tree = { top, label: null }
+  if (!isGit) {
+    treesCache = [main]
+    return treesCache
+  }
+  try {
+    const listed = parseWorktrees(await gitOut($, top, ['worktree', 'list', '--porcelain', '-z']))
+    const others = listed.map(tree => ({ top: fromMsys(tree.top, top), label: tree.label })).filter(tree => keyOf(tree.top) !== keyOf(top))
+    treesCache = [main, ...others]
+  } catch (error) {
+    $.ui.log(`listing the work trees failed: ${reasonOf(error)}`, { to: 'debug' })
+    treesCache ??= [main]
+  }
+  return treesCache
+}
+
+// The tree a path is in: the innermost, where one sits inside another (as Claude's own worktrees sit in the repo).
+function treeIn(trees: readonly Tree[], path: string): Tree | null {
+  let found: Tree | null = null
+  for (const tree of trees) {
+    if (relOf(path, tree.top) === null) continue
+    if (found === null || normalize(tree.top).length > normalize(found.top).length) found = tree
+  }
+  return found
+}
+
+// The trees, asked of git again when a path is in none of them: a work tree may have been added since.
+async function treesFor($: EngineInterface, paths: readonly string[]): Promise<Tree[]> {
+  const trees = await treesOf($)
+  return isGit && paths.some(path => treeIn(trees, path) === null) ? treesOf($, true) : trees
+}
+
+// A file as the person reads it: its path from its tree's top, the branch before it in another work tree.
+function nameOf(file: { rel: string; tree?: string | null }): string {
+  return typeof file.tree === 'string' ? `[${file.tree}] ${file.rel}` : file.rel
 }
 
 async function look($: EngineInterface, path: string): Promise<Seen> {
@@ -182,10 +238,10 @@ function isTracked(track: ConvoDiffTrack, path: string): boolean {
   return track.files.some(file => file.key === key)
 }
 
-// The first touch decides a file's base, and the HEAD it was taken at; later touches leave them alone, and files
-// outside the repo never count.
-function withBase(track: ConvoDiffTrack, top: string, path: string, found: Found, head: string | null): ConvoDiffTrack {
-  if (relOf(path, top) === null || isTracked(track, path)) return track
+// The first touch decides a file's base, and the HEAD of its tree it was taken at; later touches leave them alone,
+// and files outside the repo's work trees never count.
+function withBase(track: ConvoDiffTrack, trees: readonly Tree[], path: string, found: Found, head: string | null): ConvoDiffTrack {
+  if (treeIn(trees, path) === null || isTracked(track, path)) return track
   const seq = track.seq + 1
   const file: ConvoDiffBase = { key: keyOf(path), path, base: found.base, isLost: found.isLost, seq, head }
   return { ...track, seq, files: [...track.files, file] }
@@ -208,8 +264,8 @@ function serial<T>(job: () => Promise<T>): Promise<T> {
 let who: { session: string | null; title: string | null } = { session: null, title: null }
 
 const cache = new Map<string, { base: string | null; isLost: boolean; seen: Seen; file: ConvoDiffFile }>()
-// HEAD at the last refresh: when it moves, every file is looked at again.
-let lastHead: string | null | undefined
+// Each tree's HEAD at the last refresh: when one moves, every file is looked at again.
+let lastHead: string | undefined
 
 async function persist($: EngineInterface, track: ConvoDiffTrack): Promise<void> {
   const encoder = new TextEncoder()
@@ -265,9 +321,10 @@ function undoChain(chain: Chain, after: string | null | undefined): Found {
 }
 
 // Files the transcript shows this conversation changed before this process followed it (the mod enabled late).
-async function adopt($: EngineInterface, track: ConvoDiffTrack, top: string): Promise<ConvoDiffTrack> {
+async function adopt($: EngineInterface, track: ConvoDiffTrack): Promise<ConvoDiffTrack> {
   const messages = await $.session.messages().catch(() => [])
   const cwd = await $.session.cwd()
+  const trees = await treesOf($, true)
   const chains = new Map<string, Chain>()
   let grown = track
   for (const message of messages) {
@@ -278,13 +335,13 @@ async function adopt($: EngineInterface, track: ConvoDiffTrack, top: string): Pr
           const path = absolute(edit.path, cwd)
           const chain = chains.get(keyOf(path))
           if (chain !== undefined) chain.steps.push(edit.hunks)
-          else if (relOf(path, top) === null || isTracked(grown, path)) continue
-          else if (edit.isCreated) grown = withBase(grown, top, path, { base: null, isLost: false }, null)
+          else if (treeIn(trees, path) === null || isTracked(grown, path)) continue
+          else if (edit.isCreated) grown = withBase(grown, trees, path, { base: null, isLost: false }, null)
           else chains.set(keyOf(path), { path, steps: [edit.hunks] })
         }
         for (const changed of edits.more) {
           const path = absolute(changed, cwd)
-          if (!chains.has(keyOf(path))) grown = withBase(grown, top, path, { base: null, isLost: true }, null)
+          if (!chains.has(keyOf(path))) grown = withBase(grown, trees, path, { base: null, isLost: true }, null)
         }
         continue
       }
@@ -292,37 +349,44 @@ async function adopt($: EngineInterface, track: ConvoDiffTrack, top: string): Pr
       if (seen === null) continue
       const chain = chains.get(keyOf(seen.path))
       if (chain === undefined) {
-        grown = withBase(grown, top, seen.path, seen.found, null)
+        grown = withBase(grown, trees, seen.path, seen.found, null)
         continue
       }
       // A file tool starts from the text the Bash commands before it left.
       chains.delete(keyOf(seen.path))
-      grown = withBase(grown, top, chain.path, undoChain(chain, seen.found.isLost ? undefined : seen.found.base), null)
+      grown = withBase(grown, trees, chain.path, undoChain(chain, seen.found.isLost ? undefined : seen.found.base), null)
     }
   }
   // Nothing touched these after their commands: they still hold what the commands left.
   for (const chain of chains.values()) {
     const seen = await look($, chain.path)
     const after = seen.kind === 'text' ? seen.text : seen.kind === 'missing' ? null : undefined
-    grown = withBase(grown, top, chain.path, undoChain(chain, after), null)
+    grown = withBase(grown, trees, chain.path, undoChain(chain, after), null)
   }
   return grown
 }
 
-function inRepo(track: ConvoDiffTrack, top: string): ConvoDiffTrack {
-  const files = track.files.filter(file => relOf(file.path, top) !== null)
+// A work tree removed since takes its files with it.
+function inTrees(track: ConvoDiffTrack, trees: readonly Tree[]): ConvoDiffTrack {
+  const files = track.files.filter(file => treeIn(trees, file.path) !== null)
   return files.length === track.files.length ? track : { ...track, files }
 }
+
+// Whether this load of the module has read the transcript: an older version may have passed over files this one
+// follows (another work tree's).
+let isCaughtUp = false
 
 // This conversation's files: the session's, else what the store kept for it (a resume), plus what the transcript shows.
 async function ensure($: EngineInterface): Promise<ConvoDiffTrack> {
   const { startedAt: conv } = await $.session.usage()
-  const top = await topOf($)
   const held = await read($, trackAtom)
   if (held !== null && held.conv === conv) {
-    // Files outside the repo, followed before they stopped counting, drop out.
-    const pruned = inRepo(held, top)
+    const grown = isCaughtUp ? held : await adopt($, held)
+    isCaughtUp = true
+    // Files outside the repo's work trees, followed before they stopped counting, drop out.
+    const pruned = inTrees(grown, await treesOf($))
     if (pruned !== held) await update($, trackAtom, () => pruned)
+    if (grown !== held) await persist($, pruned)
     return pruned
   }
 
@@ -330,9 +394,10 @@ async function ensure($: EngineInterface): Promise<ConvoDiffTrack> {
   const keptTrack = record(kept?.track)
   const start: ConvoDiffTrack =
     kept?.v === 1 && keptTrack?.conv === conv && Array.isArray(keptTrack.files)
-      ? inRepo(keptTrack as ConvoDiffTrack, top)
+      ? inTrees(keptTrack as ConvoDiffTrack, await treesOf($))
       : { conv, seq: 0, files: [] }
-  const track = await adopt($, start, top)
+  const track = await adopt($, start)
+  isCaughtUp = true
   cache.clear()
   await update($, trackAtom, () => track)
   await update($, viewAtom, () => null)
@@ -349,9 +414,15 @@ async function keep($: EngineInterface, before: ConvoDiffTrack, after: ConvoDiff
   await persist($, after)
 }
 
-// HEAD now: a commit id, '' in a repo with no commit yet, null with no repo (or when git cannot say).
+// HEAD now in the session's tree: a commit id, '' in a repo with no commit yet, null with no repo (or when git cannot
+// say).
 async function headOf($: EngineInterface): Promise<string | null> {
-  const top = await topOf($)
+  return headAt($, await topOf($))
+}
+
+// HEAD now in the tree at `top`: each work tree has its own.
+async function headAt($: EngineInterface, top: string): Promise<string | null> {
+  await topOf($)
   if (!isGit) return null
   try {
     const ran = await $.process.run(gitArgv(['rev-parse', '--verify', '-q', 'HEAD']), { cwd: top, timeoutMs: GIT_TIMEOUT_MS })
@@ -395,18 +466,28 @@ async function blobText($: EngineInterface, top: string, blob: string): Promise<
 // What each file is compared with while only what is not committed counts: its base, unless a commit since its
 // first change took it. That is a commit where the file differs from the HEAD it was first changed at; with that
 // HEAD unknown, a HEAD whose file differs from the base. Partial commits, amends and commits from elsewhere all come
-// out the same way, as does a file the commit deleted (null).
-async function againstHead(
+// out the same way, as does a file the commit deleted (null). Each work tree's files go by its own HEAD.
+async function againstHead($: EngineInterface, bases: readonly ConvoDiffBase[], seen: ReadonlyMap<string, Seen>): Promise<Map<string, Against>> {
+  const out = new Map<string, Against>(bases.map(base => [base.key, { base: base.base, isLost: base.isLost, isCommitted: false }]))
+  const trees = await treesOf($)
+  for (const tree of trees) {
+    const mine = bases.filter(base => treeIn(trees, base.path) === tree)
+    if (mine.length > 0) await againstHeadIn($, tree.top, mine, seen, out)
+  }
+  return out
+}
+
+async function againstHeadIn(
   $: EngineInterface,
   top: string,
   bases: readonly ConvoDiffBase[],
   seen: ReadonlyMap<string, Seen>,
-): Promise<Map<string, Against>> {
-  const out = new Map<string, Against>(bases.map(base => [base.key, { base: base.base, isLost: base.isLost, isCommitted: false }]))
-  const head = await headOf($)
-  if (head === null || head === '') return out
+  out: Map<string, Against>,
+): Promise<void> {
+  const head = await headAt($, top)
+  if (head === null || head === '') return
   const moved = bases.filter(base => base.head !== head && !(base.head == null && base.isLost))
-  if (moved.length === 0) return out
+  if (moved.length === 0) return
   const relOfBase = (base: ConvoDiffBase) => relOf(base.path, top) ?? ''
   try {
     const now = await blobsIn($, top, head, moved.map(relOfBase))
@@ -434,14 +515,14 @@ async function againstHead(
   } catch (error) {
     $.ui.log(`reading HEAD failed: ${reasonOf(error)}`, { to: 'debug' })
   }
-  return out
 }
 
-function describe(base: ConvoDiffBase, against: Against, seen: Seen, top: string): ConvoDiffFile {
+function describe(base: ConvoDiffBase, against: Against, seen: Seen, tree: Tree): ConvoDiffFile {
   const file: ConvoDiffFile = {
     key: base.key,
     path: base.path,
-    rel: relOf(base.path, top) ?? normalize(base.path),
+    rel: relOf(base.path, tree.top) ?? normalize(base.path),
+    tree: tree.label,
     status: 'modified',
     isBinary: false,
     added: 0,
@@ -489,24 +570,30 @@ function statusLine(files: readonly ConvoDiffFile[]): string | undefined {
   return `這個對話改了 ${changed} 個檔案 +${added} -${removed}（/${COMMAND} 看 diff）`
 }
 
-// Re-reads the files named (or all of them) and redraws what changed. A commit since the last look redoes them all.
+// Re-reads the files named (or all of them) and redraws what changed. A commit (or a checkout) since the last look,
+// in any tree that holds this conversation's files, redoes them all.
 async function refresh($: EngineInterface, keys: ReadonlySet<string> | 'all'): Promise<void> {
   const track = await read($, trackAtom)
   if (track === null) return
-  const top = await topOf($)
+  const trees = await treesOf($)
   const prior = await read($, viewAtom)
   const isSame = prior !== null && prior.conv === track.conv
-  const head = await headOf($)
+  const bases = inTrees(track, trees).files
+  const heads: string[] = []
+  for (const tree of trees) {
+    if (tree.label !== null && !bases.some(base => treeIn(trees, base.path) === tree)) continue
+    heads.push(`${keyOf(tree.top)} ${tree.label ?? ''} ${await headAt($, tree.top)}`)
+  }
+  const head = heads.join(' | ')
   const due = head !== lastHead ? 'all' : keys
   lastHead = head
   const drawn = new Map((isSame ? prior.files : []).map(file => [file.key, file]))
   const drawnAll = new Map((isSame ? (prior.all ?? []) : []).map(file => [file.key, file]))
 
-  const bases = inRepo(track, top).files
   const fresh = bases.filter(base => due === 'all' || due.has(base.key) || !drawn.has(base.key) || !drawnAll.has(base.key))
   const seen = new Map<string, Seen>()
   for (const base of fresh) seen.set(base.key, await look($, base.path))
-  const against = await againstHead($, top, fresh, seen)
+  const against = await againstHead($, fresh, seen)
 
   const files: ConvoDiffFile[] = []
   const all: ConvoDiffFile[] = []
@@ -520,10 +607,11 @@ async function refresh($: EngineInterface, keys: ReadonlySet<string> | 'all'): P
       continue
     }
     const here: Seen = now ?? { kind: 'missing' }
-    const whole = described(base, { base: base.base, isLost: base.isLost, isCommitted: false }, here, top)
+    const tree = treeIn(trees, base.path) ?? { top: await topOf($), label: null }
+    const whole = described(base, { base: base.base, isLost: base.isLost, isCommitted: false }, here, tree)
     const since = against.get(base.key)
     all.push(whole)
-    files.push(since === undefined || !since.isCommitted ? whole : described(base, since, here, top))
+    files.push(since === undefined || !since.isCommitted ? whole : described(base, since, here, tree))
   }
 
   // The desktop has the band's button instead: the same numbers twice would only repeat themselves.
@@ -535,13 +623,13 @@ async function refresh($: EngineInterface, keys: ReadonlySet<string> | 'all'): P
 }
 
 // A file's diff is worked out again only when its text, or what it is compared with, changed.
-function described(base: ConvoDiffBase, against: Against, seen: Seen, top: string): ConvoDiffFile {
-  const key = `${against.isCommitted ? 'c' : 'b'}:${base.key}`
+function described(base: ConvoDiffBase, against: Against, seen: Seen, tree: Tree): ConvoDiffFile {
+  const key = `${against.isCommitted ? 'c' : 'b'}:${tree.label ?? ''}:${base.key}`
   const hit = cache.get(key)
   if (hit !== undefined && hit.base === against.base && hit.isLost === against.isLost && sameSeen(hit.seen, seen)) {
     return hit.file
   }
-  const file = describe(base, against, seen, top)
+  const file = describe(base, against, seen, tree)
   cache.set(key, { base: against.base, isLost: against.isLost, seen, file })
   return file
 }
@@ -562,7 +650,7 @@ function schedule($: EngineInterface, keys: readonly string[] | 'all'): void {
 }
 
 function patchText(view: ConvoDiffView | null, filter: string, isAll: boolean): string {
-  const matches = (file: ConvoDiffFile) => filter === '' || file.rel.toLowerCase().includes(filter.toLowerCase())
+  const matches = (file: ConvoDiffFile) => filter === '' || nameOf(file).toLowerCase().includes(filter.toLowerCase())
   const every = ((isAll ? view?.all : view?.files) ?? []).filter(matches)
   const committed = isAll ? [] : every.filter(file => file.isCommitted && file.status === 'same')
   const shown = every.filter(file => !committed.includes(file))
@@ -577,13 +665,14 @@ function patchText(view: ConvoDiffView | null, filter: string, isAll: boolean): 
       ? `convo-diff: ${changed} file(s) changed in this conversation (+${added} -${removed}), each compared with its content before this conversation first changed it, commits or not.`
       : `convo-diff: ${changed} file(s) this conversation changed that are not committed yet (+${added} -${removed}). A file a commit took since this conversation first changed it is compared with that commit; any other with its content before this conversation first changed it. Pass scope "all" for the whole conversation.`,
   ]
-  if (committed.length > 0) out.push(`# committed, unchanged since: ${committed.map(file => file.rel).join(', ')}`)
+  if (committed.length > 0) out.push(`# committed, unchanged since: ${committed.map(nameOf).join(', ')}`)
   let size = out.join('\n').length
   for (const file of shown) {
     const lines: string[] = ['']
     if (file.status === 'same' || file.status === 'lost' || file.isBinary) {
-      lines.push(`# ${file.rel}: ${file.status === 'same' ? 'no net change' : file.isBinary ? `binary file ${file.status}` : 'no snapshot of its content before'}`)
+      lines.push(`# ${nameOf(file)}: ${file.status === 'same' ? 'no net change' : file.isBinary ? `binary file ${file.status}` : 'no snapshot of its content before'}`)
     } else {
+      if (typeof file.tree === 'string') lines.push(`# in the work tree of branch ${file.tree}: ${normalize(file.path)}`)
       lines.push(file.status === 'added' ? '--- /dev/null' : `--- a/${file.rel}`)
       lines.push(file.status === 'deleted' ? '+++ /dev/null' : `+++ b/${file.rel}`)
       if (file.isCommitted) lines.push('# against the last commit that took it')
@@ -619,14 +708,14 @@ function canRevert(file: ConvoDiffFile): boolean {
 // The question the Explain button sends: answered in the conversation, where it can be followed up, by the
 // session's own model, which reads the net change through this plugin's tool rather than a pasted copy.
 function explainPrompt(file: ConvoDiffFile, isAll: boolean): string {
-  const path = `\`${file.rel}\``
+  const path = `\`${nameOf(file)}\``
   const ask =
     file.status === 'added'
       ? `請解釋這個對話新增的 ${path}：它是做什麼的、為什麼需要它、有什麼要注意的。`
       : file.status === 'deleted'
         ? `請解釋這個對話為什麼刪除 ${path}，刪掉之後有什麼要注意的。`
         : `請解釋這個對話對 ${path} 做的改動：改了什麼、為什麼這樣改、有什麼要注意的。`
-  const how = isAll ? `path 填 ${file.rel}，scope 填 all` : `path 填 ${file.rel}`
+  const how = isAll ? `path 填 ${nameOf(file)}，scope 填 all` : `path 填 ${nameOf(file)}`
   const since = !isAll && file.isCommitted ? '已經 commit 的部分不用講，只解釋 commit 之後的改動。' : ''
   return `${ask}${since}要看它在這個對話裡的淨改動，可以用 ${TOOL} 工具（${how}）。只要解釋，不要修改任何檔案。`
 }
@@ -634,7 +723,7 @@ function explainPrompt(file: ConvoDiffFile, isAll: boolean): string {
 // Sent as the person's own question, since they pressed for it. It starts a turn of its own once the session is
 // idle, and the call resolves only then: the toast comes first.
 async function askInChat($: EngineInterface, file: ConvoDiffFile, isBusy: boolean, isAll: boolean): Promise<void> {
-  $.ui.toast(isBusy ? `Claude 這回合結束後會解釋 ${file.rel}` : `已請 Claude 解釋 ${file.rel}`)
+  $.ui.toast(isBusy ? `Claude 這回合結束後會解釋 ${nameOf(file)}` : `已請 Claude 解釋 ${nameOf(file)}`)
   try {
     await $.prompt.submit({ text: explainPrompt(file, isAll), asUser: true })
   } catch (error) {
@@ -666,30 +755,31 @@ async function gitOut($: EngineInterface, top: string, args: readonly string[], 
   return ran.stdout
 }
 
-// Where this session's snapshots go: an index of its own in the repo's git directory (beside git's, never in the
-// work tree); 'off' with no repo, or once they proved too slow.
+// Where this session's snapshots of a tree go: an index of its own in that tree's git directory (beside git's, never
+// in the work tree); 'off' with no repo, or once they proved too slow. Each work tree has its own, by its top's key.
 type Snaps = { top: string; index: string } | 'off'
 type Snap = { top: string; tree: string }
 
-let snaps: Snaps | null = null
-let snapsTaken = 0
-// The latest snapshot, taken as each turn starts and after each command that needed one. Every file this
+const snaps = new Map<string, Snaps>()
+const snapsTaken = new Map<string, number>()
+// Each tree's latest snapshot, taken as each turn starts and after each command that needed one. Every file this
 // conversation changed since is followed already, so one that differs from it and is not followed yet was changed
 // by the command just run: one snapshot after a command is enough, and none before it.
-let lastSnap: Snap | null = null
+const lastSnaps = new Map<string, Snap>()
 
-async function snapsOf($: EngineInterface): Promise<Snaps> {
-  if (snaps !== null) return snaps
-  const top = await topOf($)
+async function snapsOf($: EngineInterface, top: string): Promise<Snaps> {
+  const held = snaps.get(keyOf(top))
+  if (held !== undefined) return held
   const dir = fromMsys((await gitOut($, top, ['rev-parse', '--absolute-git-dir']).catch(() => '')).trim(), top)
   if (dir === '') {
-    snaps = 'off'
-    return snaps
+    snaps.set(keyOf(top), 'off')
+    return 'off'
   }
   const now = await $.clock.now()
   $.clock.after(0, () => void pruneIndexes($, dir, now))
-  snaps = { top, index: `${dir}/convo-diff-${Math.random().toString(36).slice(2, 10)}.index` }
-  return snaps
+  const where = { top, index: `${dir}/convo-diff-${Math.random().toString(36).slice(2, 10)}.index` }
+  snaps.set(keyOf(top), where)
+  return where
 }
 
 async function pruneIndexes($: EngineInterface, dir: string, now: number): Promise<void> {
@@ -703,12 +793,13 @@ async function pruneIndexes($: EngineInterface, dir: string, now: number): Promi
   }
 }
 
-// The work tree as git sees it, ignored files left out, hashed into this session's index: the tree's id, or null
-// where none is taken. Kept between snapshots, the index lets git hash only what changed since the last one; a
-// failed snapshot sends the next to a fresh index, in case a killed git left its lock on this one.
-async function snap($: EngineInterface): Promise<Snap | null> {
-  const where = await snapsOf($)
+// The work tree at `top` as git sees it, ignored files left out, hashed into this session's index: the tree's id,
+// or null where none is taken. Kept between snapshots, the index lets git hash only what changed since the last one;
+// a failed snapshot sends the next to a fresh index, in case a killed git left its lock on this one.
+async function snap($: EngineInterface, top: string): Promise<Snap | null> {
+  const where = await snapsOf($, top)
   if (where === 'off') return null
+  const id = keyOf(top)
   const started = await $.clock.now()
   let tree: string
   try {
@@ -716,22 +807,62 @@ async function snap($: EngineInterface): Promise<Snap | null> {
     tree = (await gitOut($, where.top, ['write-tree'], where.index)).trim()
     if (!/^[0-9a-f]{40,64}$/.test(tree)) throw new Error(`git write-tree said ${tree.slice(0, 80)}`)
   } catch (error) {
-    snaps = null
-    snapsTaken = 0
+    snaps.delete(id)
+    snapsTaken.delete(id)
     throw error
   }
   const took = (await $.clock.now()) - started
-  snapsTaken += 1
-  if (snapsTaken > 1 && took > SNAP_SLOW_MS) {
-    snaps = 'off'
-    lastSnap = null
+  const taken = (snapsTaken.get(id) ?? 0) + 1
+  snapsTaken.set(id, taken)
+  if (taken > 1 && took > SNAP_SLOW_MS) {
+    snaps.set(id, 'off')
+    lastSnaps.delete(id)
+    const isMain = id === keyOf(await topOf($))
     $.ui.toast(
-      `這個 repo 太大，拍一次快照要 ${(took / 1000).toFixed(1)} 秒，這個 session 先不拍了：PowerShell 改的檔案不追蹤，Bash 一次改很多檔案時有些會無法比對`,
+      isMain
+        ? `這個 repo 太大，拍一次快照要 ${(took / 1000).toFixed(1)} 秒，這個 session 先不拍了：PowerShell 改的檔案不追蹤，Bash 一次改很多檔案時有些會無法比對`
+        : `worktree ${normalize(top)} 太大，拍一次快照要 ${(took / 1000).toFixed(1)} 秒，這個 session 先不拍了：在那裡用 Bash 或 PowerShell 改的檔案不追蹤`,
     )
     return { top: where.top, tree }
   }
-  lastSnap = { top: where.top, tree }
-  return lastSnap
+  const shot = { top: where.top, tree }
+  lastSnaps.set(id, shot)
+  return shot
+}
+
+// The trees whose snapshots a command is checked against: the session's, and each other work tree this conversation
+// has changed a file in. A tree it has not touched yet is not hashed around every command.
+async function busyTrees($: EngineInterface): Promise<Tree[]> {
+  const trees = await treesOf($)
+  const files = (await read($, trackAtom))?.files ?? []
+  return trees.filter(tree => tree.label === null || files.some(file => treeIn(trees, file.path) === tree))
+}
+
+// Before a command: each busy tree's latest snapshot (one taken now where there is none yet) and its HEAD.
+type Shot = { snap: Snap; head: string | null }
+
+async function shotsBefore($: EngineInterface, what: string): Promise<Shot[]> {
+  const shots: Shot[] = []
+  for (const tree of await busyTrees($)) {
+    const taken = lastSnaps.get(keyOf(tree.top)) ?? (await snap($, tree.top).catch(error => {
+      $.ui.log(`snapshot before a ${what} command failed: ${reasonOf(error)}`, { to: 'debug' })
+      return null
+    }))
+    if (taken !== null) shots.push({ snap: taken, head: await headAt($, tree.top) })
+  }
+  return shots
+}
+
+// After a command: a snapshot of each tree it was checked against, and the files that changed between the two.
+async function trackShots($: EngineInterface, shots: readonly Shot[], what: string): Promise<void> {
+  for (const shot of shots) {
+    try {
+      const after = await snap($, shot.snap.top)
+      if (after !== null) await trackSnapshots($, shot.snap, after, shot.head)
+    } catch (error) {
+      $.ui.log(`tracking a ${what} command failed: ${reasonOf(error)}`, { to: 'debug' })
+    }
+  }
 }
 
 // The files a command changed between two snapshots. A file's first touch takes its base from the snapshot before:
@@ -740,14 +871,15 @@ async function trackSnapshots($: EngineInterface, before: Snap, after: Snap, hea
   if (after.tree === before.tree) return
   const raw = await gitOut($, before.top, ['diff-tree', '-r', '-z', '--raw', '--no-renames', before.tree, after.tree])
   const track = await ensure($)
-  const top = await topOf($)
+  const trees = await treesOf($)
   let grown = track
   let bases = 0
   for (const file of parseRaw(raw)) {
     const path = `${before.top.replace(/[\\/]+$/, '')}/${file.rel}`
-    if (relOf(path, top) === null || isTracked(grown, path)) continue
+    const tree = treeIn(trees, path)
+    if (tree === null || keyOf(tree.top) !== keyOf(before.top) || isTracked(grown, path)) continue
     if (file.before === null) {
-      grown = withBase(grown, top, path, { base: null, isLost: false }, head)
+      grown = withBase(grown, trees, path, { base: null, isLost: false }, head)
       continue
     }
     bases += 1
@@ -756,7 +888,7 @@ async function trackSnapshots($: EngineInterface, before: Snap, after: Snap, hea
       bases > SNAP_MAX_BASES ? null : await gitOut($, before.top, ['cat-file', 'blob', file.before]).catch(() => null)
     const seen = text === null ? null : await look($, path)
     const base = text === null ? null : seen?.kind === 'text' ? withEol(text, seen.text) : text
-    grown = withBase(grown, top, path, { base, isLost: base === null }, head)
+    grown = withBase(grown, trees, path, { base, isLost: base === null }, head)
   }
   await keep($, track, grown)
 }
@@ -811,7 +943,9 @@ async function fileOf($: EngineInterface, key: string, conv: number): Promise<{ 
   const track = await read($, trackAtom)
   const base = track !== null && track.conv === conv ? track.files.find(file => file.key === key) : undefined
   if (base === undefined) return null
-  return { base, rel: relOf(base.path, await topOf($)) ?? normalize(base.path) }
+  const tree = treeIn(await treesOf($), base.path)
+  const rel = tree === null ? normalize(base.path) : (relOf(base.path, tree.top) ?? normalize(base.path))
+  return { base, rel: nameOf({ rel, tree: tree?.label }) }
 }
 
 // Puts a file back as what the pane compares it with: the last commit that took it, else how it was before this
@@ -827,8 +961,7 @@ async function revertFile($: EngineInterface, key: string, conv: number): Promis
     $.ui.toast(`沒辦法還原 ${rel}：${seen.reason}`)
     return
   }
-  const top = await topOf($)
-  const base = (await againstHead($, top, [file], new Map([[key, seen]]))).get(key)
+  const base = (await againstHead($, [file], new Map([[key, seen]]))).get(key)
   if (base === undefined || base.isLost) return
   const before = seen.kind === 'text' ? seen.text : null
   try {
@@ -1150,11 +1283,11 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'diff',
       description:
-        "The net unified diff of the files in this repo that this conversation changed (Edit, Write, NotebookEdit, Bash and PowerShell commands; what a command's own record leaves out comes from git snapshots of the work tree). By default only what is not committed yet: a file a commit took since this conversation first changed it is compared with that commit, any other with its content before this conversation first changed it. With scope \"all\", the whole conversation, each file against its content before this conversation first changed it, commits or not. Changes made outside this conversation to files it never touched are left out. Use it to review, summarize or commit only this conversation's changes.",
+        "The net unified diff of the files in this repo, and in its other work trees (git worktree), that this conversation changed (Edit, Write, NotebookEdit, Bash and PowerShell commands; what a command's own record leaves out comes from git snapshots of the work tree). By default only what is not committed yet: a file a commit took since this conversation first changed it is compared with that commit, any other with its content before this conversation first changed it. With scope \"all\", the whole conversation, each file against its content before this conversation first changed it, commits or not. Changes made outside this conversation to files it never touched are left out. A file in another work tree is named with its branch first, as \"[branch] path\", and compared with that work tree's own commits. Use it to review, summarize or commit only this conversation's changes.",
       inputSchema: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'Only files whose path contains this text.' },
+          path: { type: 'string', description: 'Only files whose name (path from the top of its work tree, "[branch] " before it in another work tree) contains this text.' },
           scope: {
             type: 'string',
             enum: ['pending', 'all'],
@@ -1180,7 +1313,7 @@ export const register: Register = on => {
       await serial(async () => {
         cache.clear()
         lastHead = undefined
-        lastSnap = null
+        lastSnaps.clear()
         await update($, trackAtom, () => null)
         await update($, viewAtom, () => null)
         await update($, revertAtom, () => null)
@@ -1196,9 +1329,13 @@ export const register: Register = on => {
     await serial(() => ensure($)).catch(() => undefined)
     // A commit made elsewhere (the person's own terminal) shows by the next turn.
     schedule($, 'all')
-    // What the person changed between turns is in this snapshot, so no command takes it for its own. Not awaited: the
-    // model thinks meanwhile, and the commands wait behind it in the queue.
-    void serial(() => snap($)).catch(error => $.ui.log(`snapshot at the turn's start failed: ${reasonOf(error)}`, { to: 'debug' }))
+    // What the person changed between turns is in these snapshots, so no command takes it for its own. Not awaited:
+    // the model thinks meanwhile, and the commands wait behind them in the queue. A work tree added or removed since
+    // shows here too.
+    void serial(async () => {
+      await treesOf($, true)
+      for (const tree of await busyTrees($)) await snap($, tree.top)
+    }).catch(error => $.ui.log(`snapshot at the turn's start failed: ${reasonOf(error)}`, { to: 'debug' }))
     // The desktop names a conversation after its first exchange.
     void identify($).catch(error => $.ui.log(`naming this conversation failed: ${reasonOf(error)}`, { to: 'debug' }))
 
@@ -1215,14 +1352,15 @@ export const register: Register = on => {
 
   on('tool.call', { tool: ['Edit', 'Write', 'NotebookEdit'] }, async ($, e, next) => {
     const path = e.tool === 'NotebookEdit' ? e.notebook_path : e.file_path
-    const top = await topOf($).catch(() => null)
-    if (top === null || relOf(path, top) === null) return next(e)
+    const trees = await treesFor($, [path]).catch(() => [])
+    const tree = treeIn(trees, path)
+    if (tree === null) return next(e)
 
     // Read before the first touch: the record afterwards cannot tell a new file from one too large to copy.
     const before = await serial(async () => {
       const track = await ensure($)
       if (isTracked(track, path)) return null
-      return { seen: await look($, path), head: await headOf($), known: new Set(track.files.map(file => file.key)) }
+      return { seen: await look($, path), head: await headAt($, tree.top), known: new Set(track.files.map(file => file.key)) }
     }).catch(() => null)
 
     const ran = await next(e)
@@ -1239,7 +1377,7 @@ export const register: Register = on => {
             : before?.seen.kind === 'text'
               ? { base: before.seen.text, isLost: false }
               : (own ?? { base: null, isLost: true })
-      await keep($, track, withBase(track, top, path, found, before?.head ?? null))
+      await keep($, track, withBase(track, trees, path, found, before?.head ?? null))
     }).catch(error => $.ui.log(`tracking ${path} failed: ${reasonOf(error)}`, { to: 'debug' }))
     schedule($, [keyOf(path)])
 
@@ -1252,45 +1390,51 @@ export const register: Register = on => {
     const known = await knownKeys($)
     // Before the command: one that changes files and commits them leaves them compared with that commit.
     // A snapshot is taken here only while there is none yet (the mod enabled mid-turn).
-    const before = await serial(async () => ({ head: await headOf($), snap: lastSnap ?? (await snap($).catch(() => null)) })).catch(
-      () => null,
-    )
-    const head = before?.head ?? null
+    const shots = await serial(() => shotsBefore($, 'Bash')).catch(() => [])
+    const main = await topOf($)
+    const mine = shots.find(shot => keyOf(shot.snap.top) === keyOf(main))
+    const head = mine?.head ?? (await headOf($).catch(() => null))
     const ran = await next(e)
     if (ran.deny !== undefined || ran.isError === true || ran.isReadOnly === true) return ran
 
+    // The engine's record covers the session's tree: another work tree's changes are told by its snapshots.
+    const elsewhere = shots.filter(shot => shot !== mine)
     const edits = bashEditsOf(ran.result)
-    if (edits.files.length > 0 || edits.isPartial) {
+    if (edits.files.length > 0 || edits.isPartial || elsewhere.length > 0) {
       await serial(async () => {
         const track = await ensure($)
-        const top = await topOf($)
         const cwd = await $.session.cwd()
+        const trees = await treesFor($, edits.files.map(edit => absolute(edit.path, cwd)))
+        // Each file's tree's HEAD before the command, where it is known.
+        const headFor = (tree: Tree) =>
+          tree.label === null ? head : (elsewhere.find(shot => keyOf(shot.snap.top) === keyOf(tree.top))?.head ?? null)
         let grown = track
         for (const edit of edits.files) {
           const path = absolute(edit.path, cwd)
-          if (relOf(path, top) === null || isTracked(grown, path)) continue
+          const tree = treeIn(trees, path)
+          if (tree === null || isTracked(grown, path)) continue
           if (edit.isCreated) {
-            grown = withBase(grown, top, path, { base: null, isLost: false }, head)
+            grown = withBase(grown, trees, path, { base: null, isLost: false }, headFor(tree))
             continue
           }
           const seen: Seen = edit.isDeleted ? { kind: 'missing' } : await look($, path)
           const after = seen.kind === 'text' ? seen.text : seen.kind === 'missing' ? '' : null
           const base = after === null || edit.hunks.length === 0 ? null : unapply(after, edit.hunks)
-          grown = withBase(grown, top, path, { base, isLost: base === null }, head)
+          grown = withBase(grown, trees, path, { base, isLost: base === null }, headFor(tree))
         }
         await keep($, track, grown)
+        await trackShots($, elsewhere, 'Bash')
         if (!edits.isPartial) return
 
         // The rest the snapshot before tells, against one after; what it cannot (no repo, an ignored file) is lost.
-        const first = before?.snap ?? null
-        const after = first === null ? null : await snap($).catch(error => {
-          $.ui.log(`snapshot after a Bash command failed: ${reasonOf(error)}`, { to: 'debug' })
-          return null
-        })
-        if (first !== null && after !== null) await trackSnapshots($, first, after, head)
+        if (mine !== undefined) await trackShots($, [mine], 'Bash')
         const now = await ensure($)
         let rest = now
-        for (const changed of edits.more) rest = withBase(rest, top, absolute(changed, cwd), { base: null, isLost: true }, head)
+        for (const changed of edits.more) {
+          const path = absolute(changed, cwd)
+          const tree = treeIn(trees, path)
+          if (tree !== null) rest = withBase(rest, trees, path, { base: null, isLost: true }, headFor(tree))
+        }
         await keep($, now, rest)
       }).catch(error => $.ui.log(`tracking a Bash command failed: ${reasonOf(error)}`, { to: 'debug' }))
     }
@@ -1305,21 +1449,12 @@ export const register: Register = on => {
     const guarded = await guard($, e.command, 'powershell')
     if (guarded.deny !== undefined) return { deny: guarded.deny }
     const known = await knownKeys($)
-    const before = await serial(async () => ({ snap: lastSnap ?? (await snap($)), head: await headOf($) })).catch(error => {
-      $.ui.log(`snapshot before a PowerShell command failed: ${reasonOf(error)}`, { to: 'debug' })
-      return null
-    })
+    const shots = await serial(() => shotsBefore($, 'PowerShell')).catch(() => [])
     const ran = await next(e)
     // Refused, or read-only as the engine judged it. One that failed may still have changed files.
     if (ran.deny !== undefined || ran.isReadOnly === true) return ran
 
-    if (before !== null && before.snap !== null) {
-      const { snap: first, head } = before
-      await serial(async () => {
-        const after = await snap($)
-        if (after !== null) await trackSnapshots($, first, after, head)
-      }).catch(error => $.ui.log(`tracking a PowerShell command failed: ${reasonOf(error)}`, { to: 'debug' }))
-    }
+    if (shots.length > 0) await serial(() => trackShots($, shots, 'PowerShell')).catch(() => undefined)
     schedule($, 'all')
 
     return withNotes(ran, [...guarded.notes, ...(await touchNotes($, known))])
@@ -1400,25 +1535,22 @@ export const register: Register = on => {
           ? '這個對話的改動都 commit 了'
           : '這個對話改過的檔案現在都跟原本一樣'
 
-    let budget = RENDER_BUDGET
     // A long diff in pieces, the file's name above each after the first: a window of the pane's height always holds
     // one, a line that wraps aside.
     const pieceRows = Math.max(10, (e.props.scroll?.bodyRows ?? 40) - 6)
-    const rows = files.slice(0, MAX_FILES_DRAWN).map((file, index) => {
+    // One file's rows; `fits`: its diff is drawn, where it is open.
+    const rowOf = (file: ConvoDiffFile, index: number, fits: boolean) => {
       const isOpen = isOpenOf(file)
-      const cost = file.chunks.reduce((sum, chunk) => sum + JSON.stringify(chunk).length, 0)
-      const fits = cost <= budget
-      if (isOpen && fits) budget -= cost
       const arrow = hasBody(file) ? (isOpen ? '▾' : '▸') : '·'
       const isConfirming = !isAll && confirming === file.key
       const question =
         file.status === 'added'
           ? file.isCommitted
-            ? `刪除 ${file.rel}？上次 commit 裡沒有它。`
-            : `刪除 ${file.rel}？它是這個對話新增的檔案。`
+            ? `刪除 ${nameOf(file)}？上次 commit 裡沒有它。`
+            : `刪除 ${nameOf(file)}？它是這個對話新增的檔案。`
           : file.isCommitted
-            ? `把 ${file.rel} 還原成上次 commit 的內容？已經 commit 的改動不受影響。`
-            : `把 ${file.rel} 還原成這個對話改之前的內容？`
+            ? `把 ${nameOf(file)} 還原成上次 commit 的內容？已經 commit 的改動不受影響。`
+            : `把 ${nameOf(file)} 還原成這個對話改之前的內容？`
 
       return (
         <Box flexDirection="column" marginTop={1}>
@@ -1426,7 +1558,7 @@ export const register: Register = on => {
             <Button
               plain
               key={`f${index}`}
-              label={`${arrow} ${file.rel}`}
+              label={`${arrow} ${nameOf(file)}`}
               dimColor={file.status === 'same' || file.status === 'lost'}
               onPress={pressOf(`f${index}`, () => toggle(file))}
             />
@@ -1471,7 +1603,7 @@ export const register: Register = on => {
                 <Code source={piece} format="diff" path={file.path} />
               ) : (
                 <Box flexDirection="column">
-                  <Text dimColor wrap="truncate-end">{`${arrow} ${file.rel}（續）`}</Text>
+                  <Text dimColor wrap="truncate-end">{`${arrow} ${nameOf(file)}（續）`}</Text>
                   <Code source={piece} format="diff" path={file.path} />
                 </Box>
               ),
@@ -1482,9 +1614,9 @@ export const register: Register = on => {
           {isOpen && !fits && <Text dimColor>（這個檔案的 diff 太長，先收合上面幾個檔案再看它）</Text>}
         </Box>
       )
-    })
+    }
 
-    return (
+    const head = (
       <Box flexDirection="column">
         <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
           <Text bold>{title}</Text>
@@ -1504,11 +1636,38 @@ export const register: Register = on => {
         )}
         {committed.length > 0 && (
           <Text dimColor wrap="truncate-end">
-            {`已經 commit、之後沒再改（${committed.length}）：${committed.map(file => file.rel).join('、')}`}
+            {`已經 commit、之後沒再改（${committed.length}）：${committed.map(nameOf).join('、')}`.slice(0, COMMITTED_CHARS)}
           </Text>
         )}
+      </Box>
+    )
+
+    // The whole tree is held to the engine's bound: every file's row counts, not its diff alone. Rows come first, as
+    // many as leave room for the diffs; the open diffs take what is left, from the top down.
+    const room = RENDER_BUDGET - sizeOf(head)
+    const listed: { file: ConvoDiffFile; index: number; size: number }[] = []
+    let used = 0
+    for (const [index, file] of files.slice(0, MAX_FILES_DRAWN).entries()) {
+      const size = sizeOf(rowOf(file, index, false))
+      if (used + size > (anyOpen ? room - DIFF_ROOM : room)) break
+      listed.push({ file, index, size })
+      used += size
+    }
+    let left = room - used
+    const rows = listed.map(({ file, index, size }) => {
+      if (!isOpenOf(file)) return rowOf(file, index, false)
+      const whole = rowOf(file, index, true)
+      const extra = sizeOf(whole) - size
+      if (extra > left) return rowOf(file, index, false)
+      left -= extra
+      return whole
+    })
+
+    return (
+      <Box flexDirection="column">
+        {head}
         {rows}
-        {files.length > MAX_FILES_DRAWN && <Text dimColor>{`… 還有 ${files.length - MAX_FILES_DRAWN} 個檔案沒列出來`}</Text>}
+        {files.length > listed.length && <Text dimColor>{`… 還有 ${files.length - listed.length} 個檔案沒列出來`}</Text>}
       </Box>
     )
   })

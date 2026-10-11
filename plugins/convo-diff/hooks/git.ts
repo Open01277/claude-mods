@@ -63,3 +63,39 @@ export function sameText(a: string | null, b: string | null): boolean {
   if (a === null || b === null) return a === b
   return a.replace(/\r\n/g, '\n') === b.replace(/\r\n/g, '\n')
 }
+
+// One work tree of the repo, as `git worktree list` names it: its folder, and the branch checked out there.
+export type Worktree = { top: string; label: string }
+
+// `git worktree list --porcelain -z`: `worktree <path>`, then `HEAD <id>`, `branch <ref>` or `detached`, `bare`, each
+// NUL-ended, an empty field closing each tree. A tree is labelled by its branch, else its commit, else its folder;
+// a bare repo has no files.
+export function parseWorktrees(out: string): Worktree[] {
+  const trees: Worktree[] = []
+  let top: string | null = null
+  let head = ''
+  let branch = ''
+  let isBare = false
+  const close = () => {
+    if (top !== null && top !== '' && !isBare) {
+      const folder = top.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? top
+      const label = branch !== '' ? branch.replace(/^refs\/heads\//, '') : head !== '' ? head.slice(0, 7) : folder
+      trees.push({ top, label })
+    }
+    top = null
+    head = ''
+    branch = ''
+    isBare = false
+  }
+  for (const field of out.split('\0')) {
+    if (field.startsWith('worktree ')) {
+      close()
+      top = field.slice('worktree '.length)
+    } else if (field.startsWith('HEAD ')) head = field.slice('HEAD '.length)
+    else if (field.startsWith('branch ')) branch = field.slice('branch '.length)
+    else if (field === 'bare') isBare = true
+    else if (field === '') close()
+  }
+  close()
+  return trees
+}

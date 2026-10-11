@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { gitArgv, isLeftover, parseRaw, parseTree, sameText, withEol } from '../hooks/git'
+import { gitArgv, isLeftover, parseRaw, parseTree, parseWorktrees, sameText, withEol } from '../hooks/git'
 
 const OLD = 'a'.repeat(40)
 const NEW = 'b'.repeat(40)
@@ -77,4 +77,19 @@ test('texts alike but for CRLF are the same; a missing file is only the same as 
   expect(sameText('a\n', 'b\n')).toBe(false)
   expect(sameText(null, null)).toBe(true)
   expect(sameText(null, '')).toBe(false)
+})
+
+test('git worktree list names each work tree by its branch, else its commit; a bare repo has no files', () => {
+  const out = [
+    'worktree D:/程式/Stock', `HEAD ${OLD}`, 'branch refs/heads/main', '',
+    'worktree C:/Temp/fubon-wt', `HEAD ${NEW}`, 'branch refs/heads/feat/fubon-api', '',
+    'worktree D:/detached', `HEAD ${NEW}`, 'detached', '',
+    'worktree D:/bare.git', 'bare', '',
+    '',
+  ].join('\0')
+  expect(parseWorktrees(out)).toEqual([
+    { top: 'D:/程式/Stock', label: 'main' },
+    { top: 'C:/Temp/fubon-wt', label: 'feat/fubon-api' },
+    { top: 'D:/detached', label: 'bbbbbbb' },
+  ])
 })

@@ -149,7 +149,12 @@ type Git = {
 // Git beneath the plugin, over the world's files: `add -A` and `write-tree` hash them into trees, `diff-tree` and
 // `cat-file` read those back, `status` compares the files with HEAD and the repo's index. Blobs store LF, as
 // core.autocrlf does on Windows.
-function fakeGit(on: On, w: World, top = 'D:/proj'): Git {
+// Every work tree's git answers through one hook: each takes the runs in its own folder.
+const gits = new WeakMap<On, ((e: unknown) => unknown)[]>()
+
+// `worktrees`: the repo's other work trees, as `git worktree list` names them; a git run in a folder outside `top`
+// is left to the hooks beneath (another work tree's own git).
+function fakeGit(on: On, w: World, top = 'D:/proj', worktrees: readonly { top: string; branch: string }[] = []): Git {
   const ids = new Map<string, string>()
   const blobs = new Map<string, string>()
   const trees = new Map<string, Map<string, string>>()
@@ -220,10 +225,11 @@ function fakeGit(on: On, w: World, top = 'D:/proj'): Git {
     }
     return out.map(entry => `${entry}\0`).join('')
   }
-  on('fs.list', () => ({ value: [] }) as never)
-  on('process.run', ($, e) => {
-    const { argv, init } = e as { argv: string[]; init?: { env?: Record<string, string> } }
+  const run = (e: unknown) => {
+    const { argv, init } = e as { argv: string[]; init?: { cwd?: string; env?: Record<string, string> } }
     if (argv[0] !== 'git') return { value: RAN } as never
+    const cwd = spelled(init?.cwd ?? top)
+    if (cwd !== top.toLowerCase() && !cwd.startsWith(prefix)) return undefined
     const args = argv[1] === '-c' ? argv.slice(3) : argv.slice(1)
     git.calls.push(args)
     const index = init?.env?.GIT_INDEX_FILE
@@ -240,6 +246,10 @@ function fakeGit(on: On, w: World, top = 'D:/proj'): Git {
       return said(paths.filter(rel => tree.has(rel)).map(rel => `100644 blob ${tree.get(rel)}\t${rel}\0`).join(''))
     }
     if (verb === 'rev-parse') return said(rest[0] === '--show-toplevel' ? `${top}\n` : `${top}/.git\n`)
+    if (verb === 'worktree') {
+      const trees = [{ top, branch: 'main' }, ...worktrees]
+      return said(trees.map(tree => `worktree ${tree.top}\0HEAD ${'1'.repeat(40)}\0branch refs/heads/${tree.branch}\0\0`).join(''))
+    }
     if (verb === 'add') {
       staged = new Map()
       for (const [path, text] of w.files) {
@@ -274,6 +284,20 @@ function fakeGit(on: On, w: World, top = 'D:/proj'): Git {
       return blob === undefined ? said('', 128) : said(blob)
     }
     return said('', 128)
+  }
+  const held = gits.get(on)
+  if (held !== undefined) {
+    held.push(run)
+    return git
+  }
+  gits.set(on, [run])
+  on('fs.list', () => ({ value: [] }) as never)
+  on('process.run', ($, e) => {
+    for (const one of gits.get(on) ?? []) {
+      const answer = one(e)
+      if (answer !== undefined) return answer as never
+    }
+    return { value: RAN } as never
   })
   return git
 }
@@ -1361,4 +1385,86 @@ test('other conversations are named by title, by when they began, or as this one
   // This conversation's own line carries its session and title, for the others to name it by.
   await edit($, A, 'one', 'uno')
   expect(kept.get(`conv:${NOW}`)).toMatchObject({ session: 'local_me', title: '撞車保護' })
+})
+
+test('a pane of many files keeps within what the engine draws, and says how many it left out', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  world(on, {})
+  await $.session.start(START)
+  await clock.advance(1000)
+  for (let at = 0; at < 210; at++) {
+    const path = `D:\\proj\\broker\\bridge\\node_modules\\@scope\\package-${at}\\lib\\dist\\index-${at}.js`
+    const content = Array.from({ length: 30 }, (_, line) => `line ${line} of file ${at}`).join('\n') + '\n'
+    await $.tool.call({ tool: 'Write', file_path: path, content } as never)
+  }
+  await clock.advance(1000)
+
+  for (const surface of SURFACES) {
+    const ui = await mountPane($, surface)
+    const tree = await ui.drawn()
+    const text = textOf(tree)
+    await ui.unmount()
+    expect(JSON.stringify(tree).length).toBeLessThan(100_000)
+    expect(text).toContain('這個對話改了 210 個檔案')
+    expect(text).toContain('package-0/lib/dist/index-0.js')
+    // The first file's diff is drawn; the files past what fits are counted.
+    expect(text).toContain('+line 29 of file 0')
+    expect(text).toMatch(/… 還有 \d+ 個檔案沒列出來/)
+  }
+})
+
+test("files this conversation changed in another work tree show under its branch, against that tree's commits", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const WT = 'D:\\wt'
+  const SERVER = 'D:\\wt\\server.js'
+  const NESTED = 'D:\\proj\\.claude\\worktrees\\fix\\b.txt'
+  const OUTSIDE = 'D:\\elsewhere\\x.txt'
+  const w = world(on, { [A]: 'one\n', [SERVER]: 'srv\n', [NESTED]: 'b\n', [OUTSIDE]: 'x\n' })
+  const wt = fakeGit(on, w, 'D:/wt')
+  const nested = fakeGit(on, w, 'D:/proj/.claude/worktrees/fix')
+  const git = fakeGit(on, w, 'D:/proj', [
+    { top: 'D:/wt', branch: 'feat/x' },
+    { top: 'D:/proj/.claude/worktrees/fix', branch: 'fix' },
+  ])
+  git.commit()
+  wt.commit()
+  nested.commit()
+  await $.session.start(START)
+  await clock.advance(1000)
+
+  await edit($, A, 'one', 'uno')
+  await edit($, SERVER, 'srv', 'server')
+  await edit($, NESTED, 'b', 'bee')
+  await edit($, OUTSIDE, 'x', 'ex')
+  await clock.advance(1000)
+  let text = await drawn($)
+  expect(text).toContain('a.txt')
+  expect(text).toContain('[feat/x] server.js')
+  // A work tree inside the repo's folder is its own, not the repo's `.claude/worktrees/fix/b.txt`.
+  expect(text).toContain('[fix] b.txt')
+  expect(text).not.toContain('.claude/worktrees')
+  expect(text).not.toContain('x.txt')
+  expect(text).toContain('+server')
+  const patch = await patchOf($, { path: '[feat/x]' })
+  expect(patch).toContain('# in the work tree of branch feat/x: d:/wt/server.js'.replace('d:', 'D:'))
+  expect(patch).toContain('--- a/server.js')
+  expect(patch).not.toContain('a.txt')
+
+  // A commit in that tree takes its file; the session's tree is left as it was.
+  wt.commit()
+  await $.turn.start({ turnId: 't1' } as never)
+  await clock.advance(1000)
+  text = await drawn($)
+  expect(text).toContain('已經 commit、之後沒再改（1）：[feat/x] server.js')
+  expect(text).toContain('+uno')
+
+  // PowerShell in that tree is followed through its own snapshots.
+  w.shell = () => w.files.set(spelled('D:\\wt\\new.js'), 'fresh\n')
+  await $.tool.call({ tool: 'PowerShell', command: `Set-Content ${WT}\\new.js fresh` } as never)
+  await clock.advance(1000)
+  text = await drawn($)
+  expect(text).toContain('[feat/x] new.js')
+  expect(text).toContain('+fresh')
 })

@@ -7,7 +7,7 @@ export type ConvoDiffBase = {
   // The content before could not be kept (too large, unreadable, or dropped from the store).
   isLost: boolean
   seq: number
-  // HEAD when the conversation first changed the file: '' with no commit yet, null or absent when unknown (a file
+  // HEAD of its work tree when the conversation first changed the file: '' with no commit yet, null or absent when unknown (a file
   // read back from the transcript, or kept by an older version). A commit since that took the file moves its base.
   head?: string | null
 }
@@ -25,7 +25,10 @@ export type ConvoDiffStatus = 'added' | 'modified' | 'deleted' | 'same' | 'lost'
 export type ConvoDiffFile = {
   key: string
   path: string
+  // Its path from the top of its work tree.
   rel: string
+  // The branch of the other work tree it is in (git worktree); null (or absent) in the one the session started in.
+  tree?: string | null
   status: ConvoDiffStatus
   isBinary: boolean
   added: number
