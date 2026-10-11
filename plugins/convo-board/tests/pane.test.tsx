@@ -368,3 +368,31 @@ test('a terminal conversation tells the boards too, under its transcript id, and
   const text = await drawn($, 'terminal')
   expect(text).toContain('正在：讀 a.ts')
 })
+
+test('知道了 puts an unseen card away on every board, until that conversation ends a turn again', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on, $, {
+    // A terminal run that failed at once: no link to jump to, no answer to read.
+    'conv:cli-x': entry('cli-x', { isDesktop: false, link: null, phase: 'done', since: NOW - 12 * MINUTE, outcome: 'failed', isSeen: false }),
+    'conv:local_r': entry('local_r', { phase: 'running', since: NOW - MINUTE, turnAt: NOW - MINUTE, doing: '執行 npm test' }),
+  })
+  w.sessions = [{ sessionId: 'local_r', title: '跑測試', cwd: 'D:\程式\Stock', link: link('local_r'), isRunning: true }]
+  await $.session.start(START)
+  await clock.settle()
+
+  const ui = await $.ui.mount({ plugin: 'convo-board', surface: 'desktop', component: 'Pane', props: PANE_PROPS as never, requestId: PANE })
+  expect(textOf(await ui.drawn())).toContain('出錯停下來了')
+  expect(await ui.find({ key: 'go:cli-x' })).toBeUndefined()
+  // Only an unseen card can be put away.
+  expect(await ui.find({ key: 'ok:local_r' })).toBeUndefined()
+  await ui.press({ key: 'ok:cli-x' })
+  expect(textOf(await ui.drawn())).not.toContain('出錯停下來了')
+  expect(textOf(await ui.drawn())).toContain('跑測試')
+  await ui.unmount()
+
+  // It ends another turn: the card is back.
+  await clock.advance(MINUTE)
+  w.kept.set('conv:cli-x', entry('cli-x', { isDesktop: false, link: null, phase: 'done', since: NOW + MINUTE, answer: '好了', outcome: 'answered', isSeen: false, beat: NOW + MINUTE }))
+  await clock.advance(5000)
+  expect(await drawn($)).toContain('好了')
+})

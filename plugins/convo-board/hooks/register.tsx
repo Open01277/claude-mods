@@ -8,12 +8,15 @@ const PLUGIN = 'convo-board'
 const PANE = 'convo-board'
 const TITLE = '看板'
 const COMMAND = 'convo-board'
-// The store's keys: each conversation's line, and the conversations whose board the person closed.
+// The store's keys: each conversation's line, the conversations whose board the person closed, and when the person
+// put away each conversation's unseen end (its own line is its own to write, so the mark is kept beside it).
 const ENTRY = 'conv:'
 const CLOSED = 'closed:'
+const SEEN = 'seen:'
 // The board's buttons, keyed by the conversation they act on.
 const GO = 'go:'
 const PEEK = 'peek:'
+const OK = 'ok:'
 // The desktop's own tools: who this conversation is, and every conversation it keeps.
 const DESKTOP = 'ccd_session_mgmt'
 
@@ -217,6 +220,7 @@ async function entries($: EngineInterface, now: number): Promise<ConvoBoardEntry
     if (age > KEEP_MS || (isQuiet && age > QUIET_KEEP_MS)) {
       await $.store.delete(key)
       await $.store.delete(`${CLOSED}${entry.id}`)
+      await $.store.delete(`${SEEN}${entry.id}`)
       continue
     }
     found.push(entry)
@@ -236,7 +240,14 @@ async function refresh($: EngineInterface, isForced: boolean): Promise<void> {
     sessions = await listSessions($)
     listedAt = now
   }
-  const view = buildView(await entries($, now), me?.isDesktop === true ? sessions : null, me?.id ?? '', now)
+  const found = await entries($, now)
+  const dismissed = new Map<string, number>()
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(SEEN)) continue
+    const at = await $.store.get(key)
+    if (typeof at === 'number') dismissed.set(key.slice(SEEN.length), at)
+  }
+  const view = buildView(found, me?.isDesktop === true ? sessions : null, me?.id ?? '', now, dismissed)
   const text = JSON.stringify(view)
   if (text === shown) return
   shown = text
@@ -290,6 +301,12 @@ async function press($: EngineInterface, key: string): Promise<void> {
     lastPeek.set(key, now)
     const id = key.slice(PEEK.length)
     await update($, openAtom, open => ({ ...open, [id]: open[id] !== true }))
+    return
+  }
+  // Put away: the row leaves every board, until that conversation ends a turn again.
+  if (key.startsWith(OK)) {
+    await $.store.set(`${SEEN}${key.slice(OK.length)}`, now)
+    await refresh($, true)
   }
 }
 
@@ -539,6 +556,9 @@ export const register: Register = on => {
         ...(row.answer === null
           ? []
           : [<Button key={`${PEEK}${row.id}`} label={isOpen ? '收起' : '看結果'} onPress={() => void press($, `${PEEK}${row.id}`)} />]),
+        ...(row.section !== 'unseen'
+          ? []
+          : [<Button key={`${OK}${row.id}`} label="知道了" onPress={() => void press($, `${OK}${row.id}`)} />]),
       ]
       // A card: the project and how long on top, then the title, what it does, and what the person said.
       return (

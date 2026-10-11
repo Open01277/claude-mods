@@ -181,11 +181,13 @@ function rowOf(entry: ConvoBoardEntry, listed: ConvoBoardSession | undefined, no
 
 // The board: every other conversation that waits on the person, ended unseen, or runs, by what the desktop lists.
 // `sessions` null: the desktop's list could not be read, so nothing is dropped for being missing from it.
+// `dismissed`: when the person put away each conversation's unseen end; one that ended again since shows again.
 export function buildView(
   entries: readonly ConvoBoardEntry[],
   sessions: readonly ConvoBoardSession[] | null,
   meId: string,
   now: number,
+  dismissed: ReadonlyMap<string, number> = new Map(),
 ): ConvoBoardView {
   const listed = sessions === null ? null : new Map(sessions.map(session => [session.id, session]))
   const reported = new Set<string>()
@@ -197,7 +199,10 @@ export function buildView(
     // The desktop lists every conversation it keeps: one it no longer lists was archived or deleted.
     if (listed !== null && entry.isDesktop && session === undefined) continue
     const row = rowOf(entry, session, now)
-    if (row !== null) rows.push(row)
+    if (row === null) continue
+    const putAway = dismissed.get(row.id)
+    if (row.section === 'unseen' && putAway !== undefined && row.at <= putAway) continue
+    rows.push(row)
   }
   // Running with no line of its own: a conversation opened before the board was installed.
   for (const session of sessions ?? []) {
