@@ -138,11 +138,12 @@ async function treesOf($: EngineInterface, isFresh = false): Promise<Tree[]> {
   return treesCache
 }
 
-// The tree a path is in: the innermost, where one sits inside another (as Claude's own worktrees sit in the repo).
+// The tree a path (or a folder, its top among them) is in: the innermost, where one sits inside another (as Claude's
+// own worktrees sit in the repo).
 function treeIn(trees: readonly Tree[], path: string): Tree | null {
   let found: Tree | null = null
   for (const tree of trees) {
-    if (relOf(path, tree.top) === null) continue
+    if (keyOf(path) !== keyOf(tree.top) && relOf(path, tree.top) === null) continue
     if (found === null || normalize(tree.top).length > normalize(found.top).length) found = tree
   }
   return found
@@ -249,6 +250,61 @@ function withBase(track: ConvoDiffTrack, trees: readonly Tree[], path: string, f
 
 function storeKey(conv: number): string {
   return `conv:${conv}`
+}
+
+// What a file holds, as a short print to compare by; null where it cannot be read.
+function printOf(seen: Seen): string | null {
+  if (seen.kind === 'missing') return 'none'
+  if (seen.kind === 'error') return null
+  const text = seen.text
+  let h1 = 0xdeadbeef ^ text.length
+  let h2 = 0x41c6ce57 ^ text.length
+  for (let at = 0; at < text.length; at++) {
+    const c = text.charCodeAt(at)
+    h1 = Math.imul(h1 ^ c, 2654435761)
+    h2 = Math.imul(h2 ^ c, 1597334677)
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909)
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909)
+  return `${text.length}:${(h2 >>> 0).toString(36)}.${(h1 >>> 0).toString(36)}`
+}
+
+// The most files one call prints what it left in; past it, other conversations' commands cannot tell those apart.
+const LEAVE_MAX = 200
+
+// Notes what this conversation just left in the files named that it follows.
+async function leave($: EngineInterface, track: ConvoDiffTrack, paths: readonly string[]): Promise<ConvoDiffTrack> {
+  let left: Record<string, string> | null = null
+  for (const path of paths.filter(path => isTracked(track, path)).slice(0, LEAVE_MAX)) {
+    const print = printOf(await look($, path))
+    const key = keyOf(path)
+    if (print === null || (left ?? track.left)?.[key] === print) continue
+    left ??= { ...track.left }
+    left[key] = print
+  }
+  return left === null ? track : { ...track, left }
+}
+
+// Of the files named, found changed after a command, those holding just what another conversation last left in them:
+// that conversation changed them meanwhile, maybe while the command ran, not this one.
+async function leftByOthers($: EngineInterface, conv: number, paths: readonly string[]): Promise<Set<string>> {
+  const out = new Set<string>()
+  if (paths.length === 0) return out
+  const wanted = new Set(paths.map(keyOf))
+  const theirs = new Map<string, Set<string>>()
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith('conv:') || key === storeKey(conv)) continue
+    const left = record(record(record(await $.store.get(key))?.track)?.left)
+    for (const [file, print] of Object.entries(left ?? {})) {
+      if (wanted.has(file) && typeof print === 'string') theirs.set(file, new Set([...(theirs.get(file) ?? []), print]))
+    }
+  }
+  for (const path of paths) {
+    const prints = theirs.get(keyOf(path))
+    const now = prints === undefined ? null : printOf(await look($, path))
+    if (now !== null && prints?.has(now) === true) out.add(keyOf(path))
+  }
+  return out
 }
 
 let queue: Promise<unknown> = Promise.resolve()
@@ -865,19 +921,22 @@ async function trackShots($: EngineInterface, shots: readonly Shot[], what: stri
   }
 }
 
-// The files a command changed between two snapshots. A file's first touch takes its base from the snapshot before:
-// git's blob, with the line endings the file has now.
+// The files a command changed between two snapshots, but for those another conversation changed meanwhile. A file's
+// first touch takes its base from the snapshot before: git's blob, with the line endings the file has now.
 async function trackSnapshots($: EngineInterface, before: Snap, after: Snap, head: string | null): Promise<void> {
   if (after.tree === before.tree) return
   const raw = await gitOut($, before.top, ['diff-tree', '-r', '-z', '--raw', '--no-renames', before.tree, after.tree])
   const track = await ensure($)
   const trees = await treesOf($)
+  const changed = parseRaw(raw)
+    .map(file => ({ ...file, path: `${before.top.replace(/[\\/]+$/, '')}/${file.rel}` }))
+    .filter(file => keyOf(treeIn(trees, file.path)?.top ?? '') === keyOf(before.top))
+  const theirs = await leftByOthers($, track.conv, changed.filter(file => !isTracked(track, file.path)).map(file => file.path))
   let grown = track
   let bases = 0
-  for (const file of parseRaw(raw)) {
-    const path = `${before.top.replace(/[\\/]+$/, '')}/${file.rel}`
-    const tree = treeIn(trees, path)
-    if (tree === null || keyOf(tree.top) !== keyOf(before.top) || isTracked(grown, path)) continue
+  for (const file of changed) {
+    const path = file.path
+    if (isTracked(grown, path) || theirs.has(keyOf(path))) continue
     if (file.before === null) {
       grown = withBase(grown, trees, path, { base: null, isLost: false }, head)
       continue
@@ -890,7 +949,7 @@ async function trackSnapshots($: EngineInterface, before: Snap, after: Snap, hea
     const base = text === null ? null : seen?.kind === 'text' ? withEol(text, seen.text) : text
     grown = withBase(grown, trees, path, { base, isLost: base === null }, head)
   }
-  await keep($, track, grown)
+  await keep($, track, await leave($, grown, changed.map(file => file.path)))
 }
 
 // With the keys: on the desktop a pane without them spends a first click on taking them.
@@ -948,6 +1007,14 @@ async function fileOf($: EngineInterface, key: string, conv: number): Promise<{ 
   return { base, rel: nameOf({ rel, tree: tree?.label }) }
 }
 
+// The pane's own writes are this conversation's too.
+async function noteLeft($: EngineInterface, path: string): Promise<void> {
+  await serial(async () => {
+    const track = await ensure($)
+    await keep($, track, await leave($, track, [path]))
+  }).catch(error => $.ui.log(`noting ${path} failed: ${reasonOf(error)}`, { to: 'debug' }))
+}
+
 // Puts a file back as what the pane compares it with: the last commit that took it, else how it was before this
 // conversation first changed it. Never further back than a commit: what is committed (or pushed) stays. What it
 // replaced is kept for an undo.
@@ -971,6 +1038,7 @@ async function revertFile($: EngineInterface, key: string, conv: number): Promis
     $.ui.toast(`沒辦法還原 ${rel}：${reasonOf(error)}`)
     return
   }
+  await noteLeft($, file.path)
   const canUndo = (before?.length ?? 0) <= UNDO_MAX
   await setRevert($, conv, null, undo => {
     if (canUndo) undo[key] = { before, after: base.base }
@@ -1024,6 +1092,7 @@ async function undoRevert($: EngineInterface, key: string, conv: number): Promis
     $.ui.toast(`沒辦法復原 ${rel}：${reasonOf(error)}`)
     return
   }
+  await noteLeft($, base.path)
   await drop()
   $.ui.toast(`已復原 ${rel}`)
   await tellModel($, `[convo-diff] 我復原了剛才對 ${rel} 的還原，檔案回到還原之前的內容${undo.before === null ? '（也就是不存在）' : ''}。之後要改它請先重新讀取。`)
@@ -1169,36 +1238,47 @@ function refusal(blocked: ReadonlyMap<GitOp, Clash[]>, own: readonly string[]): 
 }
 
 // Before a command runs: one whose git would commit, or throw away, changes another conversation made and has not
-// committed is refused; one that commits a file both conversations changed only says so. It fails open: a guard that
-// cannot tell lets the command run.
+// committed is refused; one that commits a file both conversations changed only says so. Each git command is held to
+// the work tree it runs in, its files, HEAD and pathspecs that tree's own. It fails open: a guard that cannot tell lets
+// the command run.
 async function guard($: EngineInterface, command: string, shell: Shell): Promise<{ deny?: string; notes: string[] }> {
   try {
-    const top = await topOf($)
+    await topOf($)
     if (!isGit) return { notes: [] }
-    const inRepoTop = (cwd: string) => keyOf(cwd) === keyOf(top) || relOf(cwd, top) !== null
-    const ops = gitOpsOf(command, shell, await $.session.cwd()).filter(op => inRepoTop(op.cwd))
+    const found = gitOpsOf(command, shell, await $.session.cwd())
+    if (found.length === 0) return { notes: [] }
+    const trees = await treesFor($, found.map(op => op.cwd))
+    const ops = found.filter(op => treeIn(trees, op.cwd) !== null)
     if (ops.length === 0) return { notes: [] }
     const track = await serial(() => ensure($))
     const others = await othersOf($, track.conv)
     if (others.size === 0) return { notes: [] }
 
-    const dirty = parseStatus(await gitOut($, top, ['status', '--porcelain=v1', '-z', '--untracked-files=all']))
     const mine = new Map(track.files.map(file => [file.key, file]))
-    const head = await headOf($)
-    const keyIn = (rel: string) => keyOf(`${top.replace(/[\\/]+$/, '')}/${rel}`)
     const blocked = new Map<GitOp, Clash[]>()
     const shared: Clash[] = []
-    for (const file of dirty) {
-      const owners = others.get(keyIn(file.rel))
-      if (owners === undefined) continue
-      const own = mine.get(keyIn(file.rel))
-      // A file both changed holds the other's changes until a commit takes it.
-      if (own !== undefined && (await holdsForeign($, top, own, head)) === false) continue
-      for (const op of ops) {
-        if (!takesFile(op, file, top)) continue
-        const clash = { rel: file.rel, owners }
-        if (own !== undefined && op.kind === 'stage') shared.push(clash)
-        else blocked.set(op, [...(blocked.get(op) ?? []), clash])
+    // This conversation's own files not committed yet, in the trees the command reaches.
+    const ownDirty: string[] = []
+    for (const tree of trees) {
+      const here = ops.filter(op => treeIn(trees, op.cwd) === tree)
+      if (here.length === 0) continue
+      const dirty = parseStatus(await gitOut($, tree.top, ['status', '--porcelain=v1', '-z', '--untracked-files=all']))
+      const head = await headAt($, tree.top)
+      const keyIn = (rel: string) => keyOf(`${tree.top.replace(/[\\/]+$/, '')}/${rel}`)
+      for (const file of dirty) {
+        const name = nameOf({ rel: file.rel, tree: tree.label })
+        const own = mine.get(keyIn(file.rel))
+        if (own !== undefined) ownDirty.push(name)
+        const owners = others.get(keyIn(file.rel))
+        if (owners === undefined) continue
+        // A file both changed holds the other's changes until a commit takes it.
+        if (own !== undefined && (await holdsForeign($, tree.top, own, head)) === false) continue
+        for (const op of here) {
+          if (!takesFile(op, file, tree.top)) continue
+          const clash = { rel: name, owners }
+          if (own !== undefined && op.kind === 'stage') shared.push(clash)
+          else blocked.set(op, [...(blocked.get(op) ?? []), clash])
+        }
       }
     }
 
@@ -1220,8 +1300,7 @@ async function guard($: EngineInterface, command: string, shell: Shell): Promise
       return { notes: [...notes, ['[convo-diff] 已照使用者的要求放行，這個指令會動到別的對話還沒 commit 的改動：', ...byOwner(all)].join('\n')] }
     }
     $.ui.toast(`convo-diff 擋下了 ${first?.text ?? 'git'}：會把${what} ${isDiscard ? '丟掉' : '一起 commit'}`)
-    const own = dirty.filter(file => mine.has(keyIn(file.rel))).map(file => file.rel)
-    return { deny: refusal(blocked, own), notes: [] }
+    return { deny: refusal(blocked, ownDirty), notes: [] }
   } catch (error) {
     $.ui.log(`guarding a command failed: ${reasonOf(error)}`, { to: 'debug' })
     return { notes: [] }
@@ -1236,16 +1315,19 @@ async function touchNotes($: EngineInterface, known: ReadonlySet<string> | null)
     const track = await read($, trackAtom)
     const fresh = (track?.files ?? []).filter(file => !known.has(file.key))
     if (track === null || fresh.length === 0) return []
-    const top = await topOf($)
+    await topOf($)
     if (!isGit) return []
     const others = await othersOf($, track.conv)
+    const trees = await treesOf($)
     const clashes: Clash[] = []
     for (const file of fresh) {
       const owners = others.get(file.key)
-      if (owners === undefined) continue
-      const commit = typeof file.head === 'string' ? file.head : await headOf($)
-      if ((await isForeign($, top, file, commit)) !== true) continue
-      clashes.push({ rel: relOf(file.path, top) ?? normalize(file.path), owners })
+      const tree = treeIn(trees, file.path)
+      if (owners === undefined || tree === null) continue
+      // Each work tree's files are held to its own commits, by their paths from its own top.
+      const commit = typeof file.head === 'string' ? file.head : await headAt($, tree.top)
+      if ((await isForeign($, tree.top, file, commit)) !== true) continue
+      clashes.push({ rel: nameOf({ rel: relOf(file.path, tree.top) ?? normalize(file.path), tree: tree.label }), owners })
     }
     if (clashes.length === 0) return []
     $.ui.toast(`這個對話改到了 ${listOf(relsOf(clashes), 3)}，裡面也有${labelsOf(clashes)}還沒 commit 的改動`)
@@ -1377,7 +1459,7 @@ export const register: Register = on => {
             : before?.seen.kind === 'text'
               ? { base: before.seen.text, isLost: false }
               : (own ?? { base: null, isLost: true })
-      await keep($, track, withBase(track, trees, path, found, before?.head ?? null))
+      await keep($, track, await leave($, withBase(track, trees, path, found, before?.head ?? null), [path]))
     }).catch(error => $.ui.log(`tracking ${path} failed: ${reasonOf(error)}`, { to: 'debug' }))
     schedule($, [keyOf(path)])
 
@@ -1404,7 +1486,10 @@ export const register: Register = on => {
       await serial(async () => {
         const track = await ensure($)
         const cwd = await $.session.cwd()
-        const trees = await treesFor($, edits.files.map(edit => absolute(edit.path, cwd)))
+        const named = [...edits.files.map(edit => edit.path), ...edits.more].map(path => absolute(path, cwd))
+        const trees = await treesFor($, named)
+        // The engine's record names what changed while the command ran, whoever changed it.
+        const theirs = await leftByOthers($, track.conv, named.filter(path => !isTracked(track, path)))
         // Each file's tree's HEAD before the command, where it is known.
         const headFor = (tree: Tree) =>
           tree.label === null ? head : (elsewhere.find(shot => keyOf(shot.snap.top) === keyOf(tree.top))?.head ?? null)
@@ -1412,7 +1497,7 @@ export const register: Register = on => {
         for (const edit of edits.files) {
           const path = absolute(edit.path, cwd)
           const tree = treeIn(trees, path)
-          if (tree === null || isTracked(grown, path)) continue
+          if (tree === null || isTracked(grown, path) || theirs.has(keyOf(path))) continue
           if (edit.isCreated) {
             grown = withBase(grown, trees, path, { base: null, isLost: false }, headFor(tree))
             continue
@@ -1422,7 +1507,7 @@ export const register: Register = on => {
           const base = after === null || edit.hunks.length === 0 ? null : unapply(after, edit.hunks)
           grown = withBase(grown, trees, path, { base, isLost: base === null }, headFor(tree))
         }
-        await keep($, track, grown)
+        await keep($, track, await leave($, grown, named))
         await trackShots($, elsewhere, 'Bash')
         if (!edits.isPartial) return
 
@@ -1433,9 +1518,9 @@ export const register: Register = on => {
         for (const changed of edits.more) {
           const path = absolute(changed, cwd)
           const tree = treeIn(trees, path)
-          if (tree !== null) rest = withBase(rest, trees, path, { base: null, isLost: true }, headFor(tree))
+          if (tree !== null && !theirs.has(keyOf(path))) rest = withBase(rest, trees, path, { base: null, isLost: true }, headFor(tree))
         }
-        await keep($, now, rest)
+        await keep($, now, await leave($, rest, named))
       }).catch(error => $.ui.log(`tracking a Bash command failed: ${reasonOf(error)}`, { to: 'debug' }))
     }
     // A command may also have changed files this conversation already follows (a formatter, a revert).

@@ -17,6 +17,9 @@ export type ConvoDiffTrack = {
   conv: number
   seq: number
   files: ConvoDiffBase[]
+  // What this conversation last left in each of its files, by key, as a print of the text ('none': no file): another
+  // conversation's command that finds a file changed, holding just that, knows the change is not its own.
+  left?: Record<string, string>
 }
 
 export type ConvoDiffStatus = 'added' | 'modified' | 'deleted' | 'same' | 'lost'

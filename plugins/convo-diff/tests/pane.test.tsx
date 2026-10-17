@@ -176,12 +176,15 @@ function fakeGit(on: On, w: World, top = 'D:/proj', worktrees: readonly { top: s
   }
   const said = (stdout: string, exitCode = 0) => ({ value: { ...RAN, stdout, exitCode } }) as never
   const prefix = `${top.toLowerCase()}/`
+  // Another work tree inside this one's folder is a repo of its own to this one's git, its files none of this one's.
+  const nested = worktrees.map(tree => `${spelled(tree.top)}/`).filter(other => other.startsWith(prefix))
+  const isOwn = (path: string) => path.startsWith(prefix) && !nested.some(other => path.startsWith(other))
   const git: Git = {
     indexes: new Set(),
     calls: [],
     commit: paths => {
       const tree = new Map(head === null ? [] : (commits.get(head) ?? []))
-      const named = paths === undefined ? [...w.files.keys()].filter(path => path.startsWith(prefix)) : paths.map(spelled)
+      const named = paths === undefined ? [...w.files.keys()].filter(isOwn) : paths.map(spelled)
       for (const path of named) {
         const text = w.files.get(path)
         const rel = path.slice(prefix.length)
@@ -208,7 +211,7 @@ function fakeGit(on: On, w: World, top = 'D:/proj', worktrees: readonly { top: s
   // index (Y); `??` for one git does not track.
   const status = () => {
     const tree = head === null ? new Map<string, string>() : (commits.get(head) ?? new Map<string, string>())
-    const inTree = [...w.files.keys()].filter(path => path.startsWith(prefix)).map(path => path.slice(prefix.length))
+    const inTree = [...w.files.keys()].filter(isOwn).map(path => path.slice(prefix.length))
     const out: string[] = []
     for (const rel of [...new Set([...tree.keys(), ...repoIndex.keys(), ...inTree])].sort()) {
       const inHead = tree.get(rel)
@@ -229,7 +232,8 @@ function fakeGit(on: On, w: World, top = 'D:/proj', worktrees: readonly { top: s
     const { argv, init } = e as { argv: string[]; init?: { cwd?: string; env?: Record<string, string> } }
     if (argv[0] !== 'git') return { value: RAN } as never
     const cwd = spelled(init?.cwd ?? top)
-    if (cwd !== top.toLowerCase() && !cwd.startsWith(prefix)) return undefined
+    if (cwd !== top.toLowerCase() && !isOwn(cwd)) return undefined
+    if (nested.some(other => cwd === other.slice(0, -1))) return undefined
     const args = argv[1] === '-c' ? argv.slice(3) : argv.slice(1)
     git.calls.push(args)
     const index = init?.env?.GIT_INDEX_FILE
@@ -253,7 +257,7 @@ function fakeGit(on: On, w: World, top = 'D:/proj', worktrees: readonly { top: s
     if (verb === 'add') {
       staged = new Map()
       for (const [path, text] of w.files) {
-        if (!path.startsWith(prefix)) continue
+        if (!isOwn(path)) continue
         const blob = text.replace(/\r\n/g, '\n')
         const id = idOf(`blob:${blob}`)
         blobs.set(id, blob)
@@ -933,6 +937,56 @@ test("files a Bash command's record names without their changes are compared wit
   }
 })
 
+test("what another conversation writes while a command runs stays its own, whatever the record or the snapshots say", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
+  const C = 'D:\\proj\\c.txt'
+  const D = 'D:\\proj\\d.txt'
+  const w = world(on, { [A]: 'one\n', [B]: 'b\n', [C]: 'c\n' })
+  const git = fakeGit(on, w)
+  git.commit()
+  await $.session.start(START)
+  await clock.advance(1000)
+  // The conversation before the /clear stands for another one still at work: what it leaves in b.txt and c.txt.
+  await edit($, B, 'b', 'bee')
+  await edit($, C, 'c', 'cee')
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } } as never)
+  w.startedAt = NOW + 60_000
+  // Its write to c.txt has not landed when this conversation's turn starts.
+  w.files.set(spelled(C), 'c\n')
+  await $.turn.start({ text: 'go on', turnId: 't1' } as never)
+  await clock.advance(1000)
+
+  // A long command: meanwhile the other conversation's b.txt is in the engine's record beside this one's a.txt.
+  w.files.set(spelled(A), 'uno\n')
+  w.bash = {
+    files: [
+      { filePath: A, hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-one', '+uno'] }] },
+      { filePath: B, hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-b', '+bee'] }] },
+    ],
+    moreFiles: 0,
+  }
+  await $.tool.call({ tool: 'Bash', command: "sed -i 's/one/uno/' a.txt && sleep 60" } as never)
+  // And its c.txt lands while a PowerShell command makes d.txt.
+  w.shell = () => {
+    w.files.set(spelled(C), 'cee\n')
+    w.files.set(spelled(D), 'new\n')
+  }
+  await $.tool.call({ tool: 'PowerShell', command: "Set-Content d.txt 'new'" } as never)
+  await clock.advance(1000)
+
+  const text = await drawn($)
+  expect(text).toContain('這個對話改了 2 個檔案')
+  expect(text).toContain('+uno')
+  expect(text).toContain('+new')
+  expect(text).not.toContain('b.txt')
+  expect(text).not.toContain('c.txt')
+  // So they are the other's to the guard as well.
+  const { deny } = await run($, 'git add -A && git commit -m uno')
+  expect(deny).toMatch(/：b\.txt、c\.txt/)
+  expect(deny).toContain('這個對話自己改、還沒 commit 的檔案：a.txt、d.txt')
+})
+
 test('with no git repo, files a Bash record names without their changes cannot be compared', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   mock.store(on)
@@ -1467,4 +1521,47 @@ test("files this conversation changed in another work tree show under its branch
   text = await drawn($)
   expect(text).toContain('[feat/x] new.js')
   expect(text).toContain('+fresh')
+})
+
+test("another work tree's files are held to that tree's own commits: no warning for what is committed there", async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const FIX = 'D:/proj/.claude/worktrees/fix'
+  const SYNC = 'D:\\proj\\.claude\\worktrees\\fix\\sync.js'
+  const NOTES = 'D:\\proj\\.claude\\worktrees\\fix\\notes.md'
+  // The other conversation worked in that tree and in the session's; all it did in that tree is committed.
+  mock.store(on, otherConversation({ [SYNC]: 'sync\n', [NOTES]: 'notes\n', [B]: 'b\n' }))
+  const w = world(on, { [A]: 'one\n', [B]: 'b\n', [SYNC]: 'sync\n', [NOTES]: 'notes\n' })
+  const fix = fakeGit(on, w, 'D:/proj/.claude/worktrees/fix')
+  const git = fakeGit(on, w, 'D:/proj', [{ top: 'D:/proj/.claude/worktrees/fix', branch: 'fix' }])
+  git.commit()
+  w.files.set(spelled(SYNC), 'sync\nby the other conversation\n')
+  fix.commit()
+  // What it left in the session's tree is not committed.
+  w.files.set(spelled(B), 'b, as the other conversation left it\n')
+  await $.session.start(START)
+  await clock.advance(1000)
+
+  // Starting on a file of that tree whose changes are committed there warns nothing.
+  const edited = (await $.tool.call({ tool: 'Edit', file_path: SYNC, old_string: 'sync\n', new_string: 'SYNC\n' } as never)) as {
+    context?: readonly string[]
+  }
+  expect(edited.context).toBeUndefined()
+  expect(w.toasts.filter(text => text.includes('還沒 commit'))).toHaveLength(0)
+
+  // A commit of everything in that tree takes nothing of the session's tree, where the other's change waits.
+  const committed = await run($, `cd ${FIX} && git commit -am sync`)
+  expect(committed.deny).toBeUndefined()
+  expect(committed.context?.join('\n') ?? '').not.toContain('別的對話')
+
+  // The other conversation's change not committed in that tree: starting on it warns, under the tree's branch.
+  w.files.set(spelled(NOTES), 'notes\nmore from the other conversation\n')
+  const mixed = (await $.tool.call({ tool: 'Edit', file_path: NOTES, old_string: 'notes\n', new_string: 'NOTES\n' } as never)) as {
+    context?: readonly string[]
+  }
+  expect(mixed.context?.join('\n')).toContain('- 另一個對話「修 Tab」：[fix] notes.md')
+  expect(w.toasts.at(-1)).toBe('這個對話改到了 [fix] notes.md，裡面也有另一個對話「修 Tab」還沒 commit 的改動')
+  // And throwing everything away there would take it.
+  const { deny } = await run($, `git -C ${FIX} checkout -- .`)
+  expect(deny).toContain('- 另一個對話「修 Tab」：[fix] notes.md')
+  expect(deny).not.toContain('b.txt')
 })

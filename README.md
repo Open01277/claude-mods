@@ -22,13 +22,13 @@
   - 整個檔案都 commit 了、之後沒再改的，收成一行「已經 commit、之後沒再改」
   - 「看整段對話」：每個檔案跟這個對話第一次改它之前比，commit 過的也算，只能看、不能還原
   - 桌面版：這個對話有改檔案時，輸入框上方右側會出現「對話 diff（檔案數）」按鈕，按一下就打開面板，不用打指令；全部 commit 了會顯示「對話 diff（都 commit 了）」；終端機則是在輸入框下面的狀態列顯示改了幾個檔案
-  - Edit、Write、Bash、PowerShell 改的檔案都會列出來。每輪對話開始時用 git 拍一次 repo 的快照，PowerShell 指令跑完、或 Bash 一次改太多檔案（Claude Code 只記得前幾個檔案改了什麼）時，再拍一次跟上一次比，所以這些檔案也比得出來；唯讀的指令不拍。快照存在 `.git` 裡自己的 index，不會動到你的暫存區
+  - Edit、Write、Bash、PowerShell 改的檔案都會列出來。每輪對話開始時用 git 拍一次 repo 的快照，PowerShell 指令跑完、或 Bash 一次改太多檔案（Claude Code 只記得前幾個檔案改了什麼）時，再拍一次跟上一次比，所以這些檔案也比得出來；唯讀的指令不拍。快照存在 `.git` 裡自己的 index，不會動到你的暫存區。指令跑的時候（例如在等一個很久的指令）別的對話剛好改了檔案，只要檔案內容就是那個對話留下的，就不會算成這個對話改的
   - 同一個 repo 的其他 worktree（`git worktree add` 開的另一份工作資料夾）裡改的檔案也會列出來，檔名前面標分支，例如 `[feat/x] server.js`；「還沒 commit 的」跟那個 worktree 自己的 commit 比。用 Bash、PowerShell 在那裡改的也算（這個對話在那個 worktree 改過檔案之後）
   - 檔案很多、面板放不下時，列到放得下為止，最後寫「還有幾個檔案沒列出來」
   - diff 很長時，往下捲每隔一段會再出現一次淡色的「檔名（續）」，捲到哪裡都看得到現在是哪個檔案
   - 「解釋」：直接在對話裡請 Claude 解釋這個檔案改了什麼、為什麼改，看完可以接著追問
   - 「還原」：確認後把檔案還原成面板比的那個版本：commit 過的還原成上次 commit 的樣子，沒 commit 過的還原成這個對話改之前的樣子（這個對話新增的檔案會刪掉）。不會倒掉已經 commit（或 push）的改動，還原後可以按「復原」
-  - 撞車保護：同一個 repo 開好幾個對話時，Claude 要跑的 git 指令如果會把別的對話還沒 commit 的改動一起 commit（`git add -A`、`git add .`、`git commit -a`，或暫存區裡有別的對話先 add 的檔案），或把它們丟掉（`git checkout -- .`、`git restore .`、`git reset --hard`、`git stash`、`git clean`），整行指令會被擋下，Claude 會改成只 add 或還原這個對話自己的檔案，你也會收到通知說擋了什麼。Bash 和 PowerShell 都算
+  - 撞車保護：同一個 repo 開好幾個對話時，Claude 要跑的 git 指令如果會把別的對話還沒 commit 的改動一起 commit（`git add -A`、`git add .`、`git commit -a`，或暫存區裡有別的對話先 add 的檔案），或把它們丟掉（`git checkout -- .`、`git restore .`、`git reset --hard`、`git stash`、`git clean`），整行指令會被擋下，Claude 會改成只 add 或還原這個對話自己的檔案，你也會收到通知說擋了什麼。Bash 和 PowerShell 都算。在其他 worktree 跑的 git 指令，看的是那個 worktree 自己的檔案；通知裡那裡的檔案前面標分支，例如 `[feat/x] server.js`
   - 你明確要 Claude 連別的對話的改動一起 commit 或丟掉時，它會在指令最後加上 `# convo-diff:allow` 放行，放行時一樣會通知你
   - 這個對話第一次改到別的對話也改過、還沒 commit 的檔案時，會通知你，也會提醒 Claude 這個檔案混著兩邊的改動。兩邊都改過的檔案還是可以 commit（會提醒連對方的改動一起進去），但不能用 git 指令還原；commit 過一次之後，對方的改動就跟著進去了，之後再改、再 commit 不會再提醒，也可以還原
   - 通知裡用標題稱呼別的對話（桌面版），沒有標題就寫它開始的時間。只認得也裝了 convo-diff 的對話
