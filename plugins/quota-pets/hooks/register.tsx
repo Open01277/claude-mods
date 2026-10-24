@@ -1673,8 +1673,6 @@ async function tick($: EngineInterface, isBusy: boolean): Promise<void> {
   await update($, activityAtom, value => (value === null ? null : { ...value, nags: value.nags + 1 }))
 }
 
-// Folding sets the band one way or the other, never toggles: a click on the desktop may arrive as a focus move and a
-// press both.
 async function setFolded($: EngineInterface, isFolded: boolean): Promise<void> {
   await update($, foldedAtom, () => isFolded)
   await $.store.set('folded', isFolded)
@@ -2228,18 +2226,5 @@ export const register: Register = on => {
         )}
       </Box>,
     )
-  })
-
-  // While the prompt holds the keys, a click on the desktop band only moves its focus ring onto a button, and the
-  // press waits for a second click. Folding harms nothing and sets one way, so the ring landing on a fold button by
-  // the person's hand folds too.
-  on('ui.focus', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const result = await next(e)
-    const isFold = e.element === FOLD || e.element === UNFOLD
-    if (result.deny === undefined && e.plugin === 'quota-pets' && isFold && e.origin.kind === 'person') {
-      $.clock.after(0, () => void setFolded($, e.element === FOLD))
-    }
-
-    return result
   })
 }
