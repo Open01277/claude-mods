@@ -17,7 +17,6 @@ import type { Hunk } from './diff'
 import { gitArgv, isLeftover, parseRaw, parseTree, parseWorktrees, sameText, withEol } from './git'
 import { absolute, fromMsys, isWindowsPath, keyOf, normalize, relOf } from './paths'
 
-const PLUGIN = 'convo-diff'
 const PANE = 'convo-diff'
 const TITLE = '對話 diff'
 const COMMAND = 'convo-diff'
@@ -31,11 +30,6 @@ const openAtom = atom({ plugin: 'convo-diff', key: 'open' } as const, null)
 const revertAtom = atom({ plugin: 'convo-diff', key: 'revert' } as const, null)
 
 const DEBOUNCE_MS = 150
-// A ring move and a click on one button this close together are one press.
-const PRESS_GAP_MS = 600
-// The desktop may draw the pane holding the keys before the ring move of the click that gave them arrives: a move
-// this soon after is still that click.
-const TAKE_MS = 500
 // A drawn tree is refused past 100,000 characters serialized: the pane keeps under this, a margin for what the
 // engine's serializing adds. The rows of the files leave at least DIFF_ROOM to the diffs while one is open.
 const RENDER_BUDGET = 85_000
@@ -952,34 +946,8 @@ async function trackSnapshots($: EngineInterface, before: Snap, after: Snap, hea
   await keep($, track, await leave($, grown, changed.map(file => file.path)))
 }
 
-// With the keys: on the desktop a pane without them spends a first click on taking them.
 function openPane($: EngineInterface): Promise<UiOpenResult> {
-  return $.ui.open({ id: PANE, title: TITLE, rows: 30, focus: true })
-}
-
-// What each of the pane's buttons does, as last drawn, so the focus ring landing on one can press it too.
-const actions = new Map<string, () => unknown>()
-let lastPress: { key: string; at: number; isRing: boolean } | null = null
-// Whether the pane holds the keys as last drawn, since when, and whether on the desktop.
-let keys = { isFocused: false, at: 0, isDesktop: false }
-
-// A press may come twice, by the focus ring and by the click: one of each on one button within the gap is one press.
-async function press($: EngineInterface, key: string, isRing = false): Promise<void> {
-  const now = await $.clock.now()
-  const last = lastPress
-  const isEcho = last !== null && last.key === key && last.isRing !== isRing && now - last.at < PRESS_GAP_MS
-  lastPress = isEcho ? null : { key, at: now, isRing }
-  if (!isEcho) await actions.get(key)?.()
-}
-
-async function noteKeys($: EngineInterface, isFocused: boolean, surface: string): Promise<void> {
-  if (isFocused !== keys.isFocused) keys = { isFocused, at: await $.clock.now(), isDesktop: surface === 'desktop' }
-}
-
-// Tab moves the ring only in a pane that holds the keys, and there a click presses by itself: a move by the person's
-// hand into a pane without them is the click that takes them, which presses nothing.
-function isTake(held: typeof keys, now: number): boolean {
-  return !held.isFocused || (held.isDesktop && now - held.at < TAKE_MS)
+  return $.ui.open({ id: PANE, title: TITLE, rows: 30 })
 }
 
 // The model keeps its own picture of the files: a note in the conversation tells it what changed beneath it.
@@ -1577,7 +1545,6 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Button, Code, Text } = $.ui.resolve(e)
-    await noteKeys($, e.props.isFocused === true, e.surface)
     const view = await read($, viewAtom)
     const open = await read($, openAtom)
     const reverts = await read($, revertAtom)
@@ -1606,10 +1573,6 @@ export const register: Register = on => {
     const toggle = (file: ConvoDiffFile) => setOpen(held => ({ ...held, keys: { ...held.keys, [file.key]: held.keys[file.key] === false } }))
     const setAll = (isOpen: boolean) => setOpen(held => ({ ...held, keys: Object.fromEntries(files.map(file => [file.key, isOpen])) }))
     const { changed, added, removed } = totals(files)
-    const pressOf = (key: string, action: () => unknown) => {
-      actions.set(key, action)
-      return () => void press($, key)
-    }
     const confirming = reverts !== null && reverts.conv === conv ? reverts.confirm : null
     const undos = reverts !== null && reverts.conv === conv ? reverts.undo : {}
     const title = isAll
@@ -1645,7 +1608,7 @@ export const register: Register = on => {
               key={`f${index}`}
               label={`${arrow} ${nameOf(file)}`}
               dimColor={file.status === 'same' || file.status === 'lost'}
-              onPress={pressOf(`f${index}`, () => toggle(file))}
+              onPress={() => toggle(file)}
             />
             <Text color={STATUS_COLOR[file.status]}>{STATUS_LABEL[file.status]}</Text>
             {file.added > 0 && <Text color="success">{`+${file.added}`}</Text>}
@@ -1655,17 +1618,17 @@ export const register: Register = on => {
               <Button
                 key={`x${index}`}
                 label="解釋"
-                onPress={pressOf(`x${index}`, () => {
+                onPress={() => {
                   // Off the press: the question is answered in the conversation, not here.
                   $.clock.after(0, () => void askInChat($, file, running.size > 0, isAll))
-                })}
+                }}
               />
             )}
             {!isAll && canRevert(file) && !isConfirming && (
-              <Button key={`r${index}`} label="還原" onPress={pressOf(`r${index}`, () => setRevert($, conv, file.key))} />
+              <Button key={`r${index}`} label="還原" onPress={() => void setRevert($, conv, file.key)} />
             )}
             {undos[file.key] !== undefined && (
-              <Button key={`u${index}`} label="復原" onPress={pressOf(`u${index}`, () => undoRevert($, file.key, conv))} />
+              <Button key={`u${index}`} label="復原" onPress={() => void undoRevert($, file.key, conv)} />
             )}
           </Box>
           {isConfirming && (
@@ -1675,9 +1638,9 @@ export const register: Register = on => {
                 key={`rc${index}`}
                 variant="primary"
                 label={file.status === 'added' ? '確定刪除' : '確定還原'}
-                onPress={pressOf(`rc${index}`, () => revertFile($, file.key, conv))}
+                onPress={() => void revertFile($, file.key, conv)}
               />
-              <Button key={`rn${index}`} label="取消" onPress={pressOf(`rn${index}`, () => setRevert($, conv, null))} />
+              <Button key={`rn${index}`} label="取消" onPress={() => void setRevert($, conv, null)} />
             </Box>
           )}
           {file.note !== null && (isOpen || !hasBody(file)) && <Text dimColor>{file.note}</Text>}
@@ -1710,11 +1673,11 @@ export const register: Register = on => {
           <Button
             key="scope"
             label={isAll ? '只看還沒 commit 的' : '看整段對話'}
-            onPress={pressOf('scope', () => setOpen(held => ({ ...held, isAll: !isAll })))}
+            onPress={() => void setOpen(held => ({ ...held, isAll: !isAll }))}
           />
-          <Button key="refresh" label="重新整理" onPress={pressOf('refresh', () => serial(() => refresh($, 'all')))} />
-          <Button key="fold" label={anyOpen ? '全部收合' : '全部展開'} onPress={pressOf('fold', () => setAll(!anyOpen))} />
-          <Button key="close" role="dismiss" label="關閉" onPress={pressOf('close', () => $.ui.close({ id: PANE }))} />
+          <Button key="refresh" label="重新整理" onPress={() => void serial(() => refresh($, 'all'))} />
+          <Button key="fold" label={anyOpen ? '全部收合' : '全部展開'} onPress={() => setAll(!anyOpen)} />
+          <Button key="close" role="dismiss" label="關閉" onPress={() => void $.ui.close({ id: PANE })} />
         </Box>
         {isAll && (
           <Text dimColor>整段對話：每個檔案跟這個對話第一次改它之前比，commit 過的也算。這裡只能看，要還原請切回「只看還沒 commit 的」。</Text>
@@ -1757,29 +1720,6 @@ export const register: Register = on => {
     )
   })
 
-  // While the prompt holds the keys, a click on the desktop's pane only takes them and moves its focus ring onto a
-  // button, and the press waits for a second click: that ring move presses it. Once the pane holds the keys, a move is
-  // Tab, which must only walk, or a click that presses by itself.
-  on('ui.focus', { component: 'Pane' }, async ($, e, next) => {
-    // As drawn before this move: the drawing after it has the pane holding the keys.
-    const held = keys
-    const now = await $.clock.now()
-    const result = await next(e)
-    const element = e.element
-    if (
-      result.deny === undefined &&
-      e.plugin === PLUGIN &&
-      e.requestId === PANE &&
-      e.origin.kind === 'person' &&
-      element !== undefined &&
-      isTake(held, now)
-    ) {
-      $.clock.after(0, () => void press($, element, true).catch(() => undefined))
-    }
-
-    return result
-  })
-
   // On the desktop, a small button above the prompt opens the pane, so there is no /convo-diff to type. It sits to the
   // right of what other plugins draw in the band.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -1800,17 +1740,5 @@ export const register: Register = on => {
         <Button key={OPEN} label={`${TITLE}（${isCommitted ? '都 commit 了' : changed}）`} onPress={() => void openPane($)} />
       </Box>
     )
-  })
-
-  // While the prompt holds the keys, a click on the desktop band only moves its focus ring onto the button, and the
-  // press waits for a second click. Opening the pane harms nothing, so the ring landing there by the person's hand
-  // opens it too; a Tab onto it does the same, since the two cannot be told apart.
-  on('ui.focus', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const result = await next(e)
-    if (result.deny === undefined && e.plugin === PLUGIN && e.element === OPEN && e.origin.kind === 'person') {
-      $.clock.after(0, () => void openPane($).catch(() => undefined))
-    }
-
-    return result
   })
 }
