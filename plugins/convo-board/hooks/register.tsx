@@ -4,7 +4,6 @@ import type { EngineInterface, Register, Timer, UiOpenResult } from 'claude-code
 import type { ConvoBoardEntry, ConvoBoardMe, ConvoBoardRow, ConvoBoardSection, ConvoBoardSession } from '../types'
 import { buildView, cut, describeAsk, describeTool, firstLine, safeLink } from './board'
 
-const PLUGIN = 'convo-board'
 const PANE = 'convo-board'
 const TITLE = '看板'
 const COMMAND = 'convo-board'
@@ -37,12 +36,6 @@ const LIST_MS = 6000
 const SAVE_MS = 800
 const ANSWER_MAX = 4000
 const ASK_MAX = 100
-// A press may come twice, by the focus ring and by the click.
-const JUMP_GAP_MS = 1500
-const PEEK_GAP_MS = 600
-// The desktop may draw the board holding the keys before the ring move of the click that gave them arrives: a move
-// this soon after is still that click.
-const TAKE_MS = 500
 const DAY = 24 * 60 * 60_000
 // Lines nobody writes any more: a quiet one goes after three days, any after two weeks.
 const QUIET_KEEP_MS = 3 * DAY
@@ -65,10 +58,6 @@ let saveTimer: Timer | null = null
 let sessions: ConvoBoardSession[] | null = null
 let listedAt = 0
 let shown = ''
-let lastJump = 0
-const lastPeek = new Map<string, number>()
-// Whether the board holds the keys as last drawn, since when, and whether on the desktop.
-let keys = { isFocused: false, at: 0, isDesktop: false }
 let opener: readonly string[] | null = null
 
 function reasonOf(error: unknown): string {
@@ -312,37 +301,14 @@ async function jump($: EngineInterface, link: string): Promise<void> {
   }
 }
 
-async function press($: EngineInterface, key: string): Promise<void> {
-  const now = await $.clock.now()
-  if (key.startsWith(GO)) {
-    if (now - lastJump < JUMP_GAP_MS) return
-    lastJump = now
-    const row = (await read($, viewAtom))?.rows.find(one => one.id === key.slice(GO.length))
-    if (row?.link) await jump($, row.link)
-    return
-  }
-  if (key.startsWith(PEEK)) {
-    if (now - (lastPeek.get(key) ?? 0) < PEEK_GAP_MS) return
-    lastPeek.set(key, now)
-    const id = key.slice(PEEK.length)
-    await update($, openAtom, open => ({ ...open, [id]: open[id] !== true }))
-    return
-  }
-  // Put away: the row leaves every board, until that conversation ends a turn again.
-  if (key.startsWith(OK)) {
-    await $.store.set(`${SEEN}${key.slice(OK.length)}`, now)
-    await refresh($, true)
-  }
+function togglePeek($: EngineInterface, id: string): Promise<unknown> {
+  return update($, openAtom, open => ({ ...open, [id]: open[id] !== true }))
 }
 
-async function noteKeys($: EngineInterface, isFocused: boolean, surface: string): Promise<void> {
-  if (isFocused !== keys.isFocused) keys = { isFocused, at: await $.clock.now(), isDesktop: surface === 'desktop' }
-}
-
-// Tab moves the ring only in a board that holds the keys, and there a click presses by itself: a move by the person's
-// hand into a board without them is the click that takes them, which presses nothing.
-function isTake(held: typeof keys, now: number): boolean {
-  return !held.isFocused || (held.isDesktop && now - held.at < TAKE_MS)
+// Put away: the row leaves every board, until that conversation ends a turn again.
+async function putAway($: EngineInterface, id: string): Promise<void> {
+  await $.store.set(`${SEEN}${id}`, await $.clock.now())
+  await refresh($, true)
 }
 
 export const register: Register = on => {
@@ -559,44 +525,8 @@ export const register: Register = on => {
     )
   })
 
-  // While the prompt holds the keys, a click on the desktop band only moves its focus ring onto the button, and the
-  // press waits for a second click. Opening the board harms nothing, so the ring landing there by the person's hand
-  // opens it too.
-  on('ui.focus', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const result = await next(e)
-    if (result.deny === undefined && e.plugin === PLUGIN && e.element === BOARD && e.origin.kind === 'person') {
-      $.clock.after(0, () => void openBoard($).catch(() => undefined))
-    }
-
-    return result
-  })
-
-  // While the prompt holds the keys, a click on the desktop's pane only takes them and moves its focus ring onto a
-  // button, and the press waits for a second click: that ring move presses it. Once the board holds the keys, a move
-  // is Tab, which must only walk, or a click that presses by itself.
-  on('ui.focus', { component: 'Pane' }, async ($, e, next) => {
-    // As drawn before this move: the drawing after it has the board holding the keys.
-    const held = keys
-    const now = await $.clock.now()
-    const result = await next(e)
-    const element = e.element
-    if (
-      result.deny === undefined &&
-      e.plugin === PLUGIN &&
-      e.requestId === PANE &&
-      e.origin.kind === 'person' &&
-      element !== undefined &&
-      isTake(held, now)
-    ) {
-      $.clock.after(0, () => void press($, element).catch(() => undefined))
-    }
-
-    return result
-  })
-
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Button, Markdown, Text } = $.ui.resolve(e)
-    await noteKeys($, e.props.isFocused === true, e.surface)
     const view = await read($, viewAtom)
     const open = await read($, openAtom)
     if (view === null) return <Text dimColor>讀取中…</Text>
@@ -605,16 +535,13 @@ export const register: Register = on => {
     const drawRow = (row: ConvoBoardRow) => {
       const isOpen = open[row.id] === true && row.answer !== null
       const detail = row.asksBack ? `${row.detail}（有問你）` : row.detail
+      const { id, link } = row
       const buttons = [
-        ...(row.link === null
-          ? []
-          : [<Button key={`${GO}${row.id}`} label="跳過去" onPress={() => void press($, `${GO}${row.id}`)} />]),
+        ...(link === null ? [] : [<Button key={`${GO}${id}`} label="跳過去" onPress={() => void jump($, link)} />]),
         ...(row.answer === null
           ? []
-          : [<Button key={`${PEEK}${row.id}`} label={isOpen ? '收起' : '看結果'} onPress={() => void press($, `${PEEK}${row.id}`)} />]),
-        ...(row.section !== 'unseen'
-          ? []
-          : [<Button key={`${OK}${row.id}`} label="知道了" onPress={() => void press($, `${OK}${row.id}`)} />]),
+          : [<Button key={`${PEEK}${id}`} label={isOpen ? '收起' : '看結果'} onPress={() => void togglePeek($, id)} />]),
+        ...(row.section !== 'unseen' ? [] : [<Button key={`${OK}${id}`} label="知道了" onPress={() => void putAway($, id)} />]),
       ]
       // A card: the project and how long on top, then the title, what it does, and what the person said.
       return (
